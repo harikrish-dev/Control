@@ -64,7 +64,7 @@ final class WiZAdapter {
                 }
                 defer { close(sock) }
 
-                var tv = timeval(tv_sec: 0, tv_usec: 650_000) // 650ms timeout
+                var tv = timeval(tv_sec: 0, tv_usec: 700_000) // 700ms timeout
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
                 var addr = sockaddr_in()
@@ -72,21 +72,23 @@ final class WiZAdapter {
                 addr.sin_port = port.bigEndian
                 inet_pton(AF_INET, host, &addr.sin_addr)
 
-                let sent = data.withUnsafeBytes { rawBuffer -> Int in
-                    guard let ptr = rawBuffer.baseAddress else { return -1 }
-                    return withUnsafePointer(to: &addr) { sockaddrPtr in
-                        sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                            sendto(sock, ptr, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                var bytesRead = 0
+                var buf = [UInt8](repeating: 0, count: 2048)
+
+                for _ in 0..<2 {
+                    let sent = data.withUnsafeBytes { rawBuffer -> Int in
+                        guard let ptr = rawBuffer.baseAddress else { return -1 }
+                        return withUnsafePointer(to: &addr) { sockaddrPtr in
+                            sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                                sendto(sock, ptr, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                            }
                         }
                     }
-                }
-                guard sent > 0 else {
-                    continuation.resume(returning: false)
-                    return
+                    guard sent > 0 else { continue }
+                    bytesRead = recv(sock, &buf, buf.count, 0)
+                    if bytesRead > 0 { break }
                 }
 
-                var buf = [UInt8](repeating: 0, count: 2048)
-                let bytesRead = recv(sock, &buf, buf.count, 0)
                 continuation.resume(returning: bytesRead > 0)
             }
         }
@@ -99,6 +101,8 @@ final class WiZAdapter {
         }
 
         device.isOnline = true
+        device.unreachableAlertMessage = nil
+        device.unreachableTrigger = nil
         switch command {
         case .power(let on): device.isOn = on
         case .brightness(let level): device.brightness = level; device.isOn = true
@@ -124,7 +128,7 @@ final class WiZAdapter {
                 }
                 defer { close(sock) }
 
-                var tv = timeval(tv_sec: 0, tv_usec: 800_000) // 800ms timeout
+                var tv = timeval(tv_sec: 0, tv_usec: 750_000) // 750ms timeout
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
                 var addr = sockaddr_in()
@@ -133,17 +137,22 @@ final class WiZAdapter {
                 inet_pton(AF_INET, host, &addr.sin_addr)
 
                 let msg = WiZCommands.getPilot()
-                _ = msg.withUnsafeBytes { rawBuffer in
-                    guard let ptr = rawBuffer.baseAddress else { return 0 }
-                    return withUnsafePointer(to: &addr) { sockaddrPtr in
-                        sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                            sendto(sock, ptr, msg.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                var bytesRead = 0
+                var buf = [UInt8](repeating: 0, count: 2048)
+
+                for _ in 0..<2 {
+                    _ = msg.withUnsafeBytes { rawBuffer in
+                        guard let ptr = rawBuffer.baseAddress else { return 0 }
+                        return withUnsafePointer(to: &addr) { sockaddrPtr in
+                            sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                                sendto(sock, ptr, msg.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                            }
                         }
                     }
+                    bytesRead = recv(sock, &buf, buf.count, 0)
+                    if bytesRead > 0 { break }
                 }
 
-                var buf = [UInt8](repeating: 0, count: 2048)
-                let bytesRead = recv(sock, &buf, buf.count, 0)
                 if bytesRead > 0 {
                     let data = Data(buf[0..<bytesRead])
                     if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -151,6 +160,8 @@ final class WiZAdapter {
                         DispatchQueue.main.async {
                             let isRecent = Date().timeIntervalSince(device.lastActionDate) < 3.0
                             device.isOnline = true
+                            device.unreachableAlertMessage = nil
+                            device.unreachableTrigger = nil
                             if !isRecent {
                                 if let state = result["state"] as? Bool {
                                     device.isOn = state

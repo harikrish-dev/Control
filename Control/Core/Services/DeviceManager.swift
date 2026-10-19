@@ -194,10 +194,6 @@ final class DeviceManager {
     }
 
     func toggleDevice(_ device: SmartDevice) {
-        if !device.isOnline {
-            device.triggerUnreachableAlert()
-            return
-        }
         device.lastActionDate = Date()
         sendCommand(.power(!device.isOn), to: device)
     }
@@ -465,11 +461,20 @@ final class DeviceManager {
         for device in devices where device.brand == .homemate {
             guard !device.tuyaDeviceId.isEmpty else { continue }
             let telemetry = await TuyaCloudBridge.shared.fetchDeviceTelemetry(deviceId: device.tuyaDeviceId)
-            let states = telemetry.socketStates
-            guard !states.isEmpty || telemetry.voltage != nil || telemetry.power != nil else {
+            if !telemetry.isOnline {
                 device.isOnline = false
+                device.isOn = false
+                device.currentPower = 0.0
+                for i in 0..<device.socketStates.count {
+                    device.socketStates[i] = false
+                }
                 continue
             }
+
+            device.isOnline = true
+            device.unreachableAlertMessage = nil
+            device.unreachableTrigger = nil
+            let states = telemetry.socketStates
 
             let now = Date()
             for (socketIdx, isOn) in states {

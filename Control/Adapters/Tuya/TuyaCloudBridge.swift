@@ -1,4 +1,5 @@
 struct TuyaDeviceTelemetry {
+    var isOnline: Bool = false
     var socketStates: [Int: Bool] = [:]
     var voltage: Double? = nil
     var power: Double? = nil
@@ -95,8 +96,10 @@ final class TuyaCloudBridge {
                     let output = String(data: data, encoding: .utf8) ?? ""
 
                     DispatchQueue.main.async {
-                        if output.contains("\"success\": true") {
+                        if output.contains("\"success\": true") && !output.contains("\"online\": false") {
                             continuation.resume(returning: (true, "Connected successfully to Tuya Cloud!"))
+                        } else if output.contains("\"online\": false") {
+                            continuation.resume(returning: (false, "Device is registered but currently offline (switch is OFF)."))
                         } else {
                             continuation.resume(returning: (false, output.isEmpty ? "Connection failed" : output))
                         }
@@ -148,47 +151,55 @@ final class TuyaCloudBridge {
 
                 if let jsonStart = output.firstIndex(of: "{"),
                    let jsonData = output[jsonStart...].data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                   let items = json["result"] as? [[String: Any]] {
-                    for item in items {
-                        guard let code = item["code"] as? String else { continue }
-                        let rawVal = item["value"]
+                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
 
-                        // 1. Sockets on/off
-                        let isValOn = (rawVal as? Bool) ?? ((rawVal as? Int) == 1)
-                        if code.hasPrefix("switch_"), let num = Int(code.replacingOccurrences(of: "switch_", with: "")) {
-                            telemetry.socketStates[num] = isValOn
-                        } else if code.hasPrefix("switch"), let num = Int(code.replacingOccurrences(of: "switch", with: "")) {
-                            telemetry.socketStates[num] = isValOn
-                        } else if code == "switch" {
-                            telemetry.socketStates[1] = isValOn
-                        }
+                    if let online = json["online"] as? Bool {
+                        telemetry.isOnline = online
+                    } else if let success = json["success"] as? Bool {
+                        telemetry.isOnline = success
+                    }
 
-                        // 2. Voltage (cur_voltage in 0.1V, e.g. 2502 -> 250.2V)
-                        if code == "cur_voltage" || code == "voltage" {
-                            if let num = rawVal as? Double {
-                                telemetry.voltage = num > 1000 ? (num / 10.0) : num
-                            } else if let num = rawVal as? Int {
-                                let d = Double(num)
-                                telemetry.voltage = d > 1000 ? (d / 10.0) : d
+                    if telemetry.isOnline, let items = json["result"] as? [[String: Any]] {
+                        for item in items {
+                            guard let code = item["code"] as? String else { continue }
+                            let rawVal = item["value"]
+
+                            // 1. Sockets on/off
+                            let isValOn = (rawVal as? Bool) ?? ((rawVal as? Int) == 1)
+                            if code.hasPrefix("switch_"), let num = Int(code.replacingOccurrences(of: "switch_", with: "")) {
+                                telemetry.socketStates[num] = isValOn
+                            } else if code.hasPrefix("switch"), let num = Int(code.replacingOccurrences(of: "switch", with: "")) {
+                                telemetry.socketStates[num] = isValOn
+                            } else if code == "switch" {
+                                telemetry.socketStates[1] = isValOn
                             }
-                        }
 
-                        // 3. Power / Total Load (cur_power in 0.1W, e.g. 479 -> 47.9W)
-                        if code == "cur_power" || code == "power" {
-                            if let num = rawVal as? Double {
-                                telemetry.power = num / 10.0
-                            } else if let num = rawVal as? Int {
-                                telemetry.power = Double(num) / 10.0
+                            // 2. Voltage
+                            if code == "cur_voltage" || code == "voltage" {
+                                if let num = rawVal as? Double {
+                                    telemetry.voltage = num > 1000 ? (num / 10.0) : num
+                                } else if let num = rawVal as? Int {
+                                    let d = Double(num)
+                                    telemetry.voltage = d > 1000 ? (d / 10.0) : d
+                                }
                             }
-                        }
 
-                        // 4. Current (cur_current in mA, e.g. 278 -> 0.278A)
-                        if code == "cur_current" || code == "current" {
-                            if let num = rawVal as? Double {
-                                telemetry.current = num / 1000.0
-                            } else if let num = rawVal as? Int {
-                                telemetry.current = Double(num) / 1000.0
+                            // 3. Power
+                            if code == "cur_power" || code == "power" {
+                                if let num = rawVal as? Double {
+                                    telemetry.power = num / 10.0
+                                } else if let num = rawVal as? Int {
+                                    telemetry.power = Double(num) / 10.0
+                                }
+                            }
+
+                            // 4. Current
+                            if code == "cur_current" || code == "current" {
+                                if let num = rawVal as? Double {
+                                    telemetry.current = num / 1000.0
+                                } else if let num = rawVal as? Int {
+                                    telemetry.current = Double(num) / 1000.0
+                                }
                             }
                         }
                     }
@@ -199,10 +210,6 @@ final class TuyaCloudBridge {
                 }
             }
         }
-    }
-
-    func fetchStatus(deviceId: String) async -> [Int: Bool] {
-        await fetchDeviceTelemetry(deviceId: deviceId).socketStates
     }
 
     func setSocketPower(deviceId: String, socketIndex: Int, isOn: Bool) async -> Bool {
@@ -237,7 +244,21 @@ final class TuyaCloudBridge {
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let output = String(data: data, encoding: .utf8) ?? ""
-                let ok = process.terminationStatus == 0 && (output.contains("\"success\": true") || output.contains("true"))
+                var ok = process.terminationStatus == 0
+                if let jsonStart = output.firstIndex(of: "{"),
+                   let jsonData = output[jsonStart...].data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                    if let success = json["success"] as? Bool, !success {
+                        ok = false
+                    }
+                    if let resObj = json["result"] as? [String: Any] {
+                        if let resVal = resObj["result"] as? Bool, !resVal {
+                            ok = false
+                        }
+                    }
+                } else if !output.contains("\"success\": true") {
+                    ok = false
+                }
 
                 DispatchQueue.main.async {
                     continuation.resume(returning: ok)
@@ -277,7 +298,21 @@ final class TuyaCloudBridge {
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let output = String(data: data, encoding: .utf8) ?? ""
-                let ok = process.terminationStatus == 0 && (output.contains("\"success\": true") || output.contains("true"))
+                var ok = process.terminationStatus == 0
+                if let jsonStart = output.firstIndex(of: "{"),
+                   let jsonData = output[jsonStart...].data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                    if let success = json["success"] as? Bool, !success {
+                        ok = false
+                    }
+                    if let resObj = json["result"] as? [String: Any] {
+                        if let resVal = resObj["result"] as? Bool, !resVal {
+                            ok = false
+                        }
+                    }
+                } else if !output.contains("\"success\": true") {
+                    ok = false
+                }
 
                 DispatchQueue.main.async {
                     continuation.resume(returning: ok)

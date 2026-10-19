@@ -178,9 +178,10 @@ def wiz_send_udp(ip, payload, timeout=1.0, wait_response=False):
     return resp_data
 
 def wiz_get_pilot(ip):
-    res = wiz_send_udp(ip, {"method": "getPilot", "params": {}}, timeout=0.8, wait_response=True)
-    if res and "result" in res:
-        return res["result"]
+    for t in (0.7, 1.2):
+        res = wiz_send_udp(ip, {"method": "getPilot", "params": {}}, timeout=t, wait_response=True)
+        if res and "result" in res:
+            return res["result"]
     return None
 
 def probe_wiz_device(ip):
@@ -631,6 +632,10 @@ def control_tuya_plug(dev, action, target="all", state="on"):
         res = subprocess.run(cmd, capture_output=True, text=True)
         try:
             data = json.loads(res.stdout)
+            is_online = data.get("online", False)
+            if not is_online:
+                print(f"🔌 {BOLD}{dev_name}{RESET}: {RED}UNREACHABLE{RESET} (Main wall switch is OFF or strip disconnected)")
+                return False
             result_items = data.get("result", [])
             sockets = {}
             pwr, volt, cur = None, None, None
@@ -840,8 +845,9 @@ def resync_all_devices():
                     if res.returncode == 0:
                         data = json.loads(res.stdout)
                         if data.get("success") is not False:
-                            result_items = data.get("result", [])
-                            if result_items:
+                            is_online = data.get("online", False)
+                            if is_online:
+                                result_items = data.get("result", [])
                                 dev["isOnline"] = True
                                 online_count += 1
                                 synced = True
@@ -870,6 +876,13 @@ def resync_all_devices():
                                 sock_str = " ".join([f"S{k}:{'ON' if v else 'OFF'}" for k, v in sorted(sockets.items())])
                                 pwr_str = f" • {pwr:.1f}W" if pwr is not None else ""
                                 print(f"  🔌 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} • {sock_str}{pwr_str}")
+                            else:
+                                dev["isOnline"] = False
+                                dev["isOn"] = False
+                                if "socketStates" in dev:
+                                    dev["socketStates"] = [False] * len(dev["socketStates"])
+                                synced = True
+                                print(f"  🔌 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Strip is offline or main power switch is OFF")
                 except Exception:
                     pass
             if not synced:
@@ -1084,6 +1097,10 @@ def list_devices():
 
         elif dev_type == "plug":
             print(f"🔌 {BOLD}{name}{RESET} ({brand} Strip) • Call as: {call_hint}")
+            if not dev.get("isOnline", True):
+                print(f"   Status: {RED}Unreachable{RESET} (Wall switch is OFF or disconnected)")
+                print()
+                continue
             sock_states = dev.get("socketStates", [True, True, True, True])
             socks = " | ".join([f"S{i+1}: {GREEN+'ON'+RESET if s else RED+'OFF'+RESET}" for i, s in enumerate(sock_states)])
             print(f"   Sockets: {socks}")
