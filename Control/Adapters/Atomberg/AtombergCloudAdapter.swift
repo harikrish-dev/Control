@@ -52,6 +52,15 @@ final class AtombergCloudAdapter {
     }
 
     func getAccessToken() async throws -> String {
+        let kToken = "atomberg_cached_token"
+        let kExpiry = "atomberg_cached_expiry"
+        if let token = UserDefaults.standard.string(forKey: kToken),
+           let exp = UserDefaults.standard.object(forKey: kExpiry) as? Date,
+           exp > Date() {
+            self.accessToken = token
+            self.tokenExpiry = exp
+            return token
+        }
         if let token = accessToken, let expiry = tokenExpiry, expiry > Date() {
             return token
         }
@@ -93,8 +102,11 @@ final class AtombergCloudAdapter {
                             ?? json["access_token"] as? String
 
                         if let validToken = token, !validToken.isEmpty {
+                            let exp = Date().addingTimeInterval(23 * 3600)
                             self.accessToken = validToken
-                            self.tokenExpiry = Date().addingTimeInterval(23 * 3600)
+                            self.tokenExpiry = exp
+                            UserDefaults.standard.set(validToken, forKey: kToken)
+                            UserDefaults.standard.set(exp, forKey: kExpiry)
                             return validToken
                         }
                     }
@@ -331,6 +343,11 @@ final class AtombergCloudAdapter {
             }
         } catch {
             print("Atomberg refreshState error: \(error)")
+            let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
+            if !hasLocalIP {
+                device.isOnline = false
+                device.isOn = false
+            }
         }
     }
 }

@@ -12,6 +12,28 @@ final class AtombergLocalAdapter {
 
     private init() {}
 
+    // MARK: - Local Reachability Probe
+
+    func checkLocalReachability(ip: String) async -> Bool {
+        guard !ip.isEmpty, ip.lowercased() != "cloud" else { return false }
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/sbin/ping")
+                proc.arguments = ["-c", "1", "-W", "500", ip]
+                proc.standardOutput = Pipe()
+                proc.standardError = Pipe()
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    continuation.resume(returning: proc.terminationStatus == 0)
+                } catch {
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+    }
+
     // MARK: - Local UDP Command Sending
 
     /// Sends a JSON control command directly to the fan over local UDP port 5600
@@ -25,6 +47,15 @@ final class AtombergLocalAdapter {
             } else {
                 throw NetworkError.protocolError("Device local IP is not configured. Please use Auto-Detect on Wi-Fi.")
             }
+        }
+
+        // Verify physical reachability before command
+        let isReachable = await checkLocalReachability(ip: host)
+        if !isReachable {
+            device.isOnline = false
+            device.isOn = false
+            device.triggerUnreachableAlert(reason: "Fan is unreachable. Wall switch is OFF or disconnected.")
+            throw NetworkError.deviceUnreachable("Wall switch is OFF or fan is disconnected")
         }
 
         var dict: [String: Any] = [:]

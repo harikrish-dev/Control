@@ -159,6 +159,15 @@ def match_device(query, devices):
     return None, None
 
 # ==========================================
+def check_ip_reachable(ip, timeout_ms=500):
+    if not ip or ip.lower() == "cloud":
+        return False
+    try:
+        res = subprocess.run(["/sbin/ping", "-c", "1", "-W", str(timeout_ms), ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
+
 # WiZ Light Controls (UDP)
 # ==========================================
 def wiz_send_udp(ip, payload, timeout=1.0, wait_response=False):
@@ -453,6 +462,10 @@ def control_atomberg_fan(dev, action, value=None):
 
     dev_id = resolve_fan_device_id(dev)
     dev_name = dev.get("name", "Fan")
+    ip = dev.get("ipAddress", "")
+    if ip and ip != "cloud" and not check_ip_reachable(ip):
+        log_err(f"\x27{dev_name}\x27 is UNREACHABLE at {ip}. Check if wall switch is ON.")
+        return False
     token = get_atomberg_access_token(api_key, refresh_token)
     if not token:
         return False
@@ -822,13 +835,19 @@ def resync_all_devices():
             if not synced:
                 ip = dev.get("ipAddress", "")
                 if ip and ip != "cloud":
-                    online_count += 1
-                    dev["isOnline"] = True
-                    st = f"{GREEN}ON{RESET}" if dev.get("isOn") else f"{RED}OFF{RESET}"
-                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} (Local) • State: {st} • Speed: {dev.get('speed', 3)}/6 [IP: {ip}]")
+                    if check_ip_reachable(ip):
+                        online_count += 1
+                        dev["isOnline"] = True
+                        st = f"{GREEN}ON{RESET}" if dev.get("isOn") else f"{RED}OFF{RESET}"
+                        print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} (Local) • State: {st} • Speed: {dev.get('speed', 3)}/6 [IP: {ip}]")
+                    else:
+                        dev["isOnline"] = False
+                        dev["isOn"] = False
+                        print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Fan is offline or wall switch is OFF [IP: {ip}]")
                 else:
                     dev["isOnline"] = False
-                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {YELLOW}OFFLINE{RESET} • Atomberg Cloud is currently unreachable")
+                    dev["isOn"] = False
+                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Fan is offline or cloud is unreachable")
 
         elif dev_type == "plug":
             dev_id = dev.get("tuyaDeviceId") or dev.get("id")
@@ -1064,6 +1083,10 @@ def list_devices():
         elif dev_type == "fan":
             dev_id = resolve_fan_device_id(dev)
             print(f"🌀 {BOLD}{name}{RESET} ({brand} Fan) • Call as: {call_hint}")
+            if not dev.get("isOnline", True):
+                print(f"   Status: {RED}Unreachable{RESET} (Wall switch is OFF or disconnected)")
+                print()
+                continue
             api_key = get_preference("atomberg_api_key")
             refresh_token = get_preference("atomberg_refresh_token")
             state_info = None

@@ -6,6 +6,33 @@ struct FanControlView: View {
 
     var body: some View {
         VStack(spacing: 20) {
+            // Offline Warning Banner
+            if !device.isOnline {
+                HStack(spacing: 10) {
+                    Image(systemName: device.unreachableIcon)
+                        .font(.title3.bold())
+                        .foregroundColor(device.unreachableColor)
+                        .symbolEffect(.bounce, value: device.unreachableTrigger)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(device.unreachableTitle)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                        Text(device.unreachableSubtitle)
+                            .font(.caption)
+                            .foregroundColor(Color.white.opacity(0.85))
+                    }
+                    Spacer()
+                }
+                .padding(14)
+                .background(Color(red: 0.16, green: 0.08, blue: 0.10))
+                .cornerRadius(12)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(device.unreachableColor.opacity(0.6), lineWidth: 1.2)
+                )
+            }
+
             // Speed Levels
             VStack(alignment: .leading, spacing: 12) {
                 Text("Fan Speed")
@@ -14,6 +41,10 @@ struct FanControlView: View {
                 HStack(spacing: 8) {
                     ForEach(1...6, id: \.self) { speed in
                         Button {
+                            if !device.isOnline {
+                                device.triggerUnreachableAlert()
+                                return
+                            }
                             HapticFeedback.snap()
                             device.speed = speed
                             device.isBoostMode = false

@@ -422,10 +422,25 @@ final class DeviceManager {
 
         // 3. Atomberg Fan
         for device in devices where device.brand == .atomberg {
-            if !AtombergCloudAdapter.shared.apiKey.isEmpty {
+            let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
+            if hasLocalIP {
+                let isReachable = await AtombergLocalAdapter.shared.checkLocalReachability(ip: device.ipAddress)
+                if isReachable {
+                    device.consecutiveFailures = 0
+                    device.isOnline = true
+                    device.unreachableAlertMessage = nil
+                    device.unreachableTrigger = nil
+                } else {
+                    device.consecutiveFailures += 1
+                    if device.consecutiveFailures >= 5 {
+                        device.isOnline = false
+                        device.isOn = false
+                    }
+                }
+            } else if !AtombergCloudAdapter.shared.apiKey.isEmpty {
                 await AtombergCloudAdapter.shared.refreshState(device)
-            } else if !device.ipAddress.isEmpty && device.ipAddress != "cloud" {
-                device.isOnline = true
+            } else {
+                device.isOnline = false
             }
         }
     }
@@ -436,7 +451,7 @@ final class DeviceManager {
 
             var pollCount = 0
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
                 pollCount += 1
 
                 // 1. Homemate 4-Socket Strip (every 2.5s)
@@ -447,9 +462,25 @@ final class DeviceManager {
                     await wizAdapter.refreshState(device)
                 }
 
-                // 3. Atomberg Fan: Cloud API is only polled every 60s if user has a cloud-only fan with valid API key.
-                if pollCount % 24 == 0 {
-                    for device in devices where device.brand == .atomberg && !AtombergCloudAdapter.shared.apiKey.isEmpty {
+                // 3. Atomberg Fan (every 2.5s locally, every 60s for cloud-only)
+                for device in devices where device.brand == .atomberg {
+                    let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
+                    if hasLocalIP {
+                        let isReachable = await AtombergLocalAdapter.shared.checkLocalReachability(ip: device.ipAddress)
+                        let isRecent = Date().timeIntervalSince(device.lastActionDate) < 4.0
+                        if isReachable {
+                            device.consecutiveFailures = 0
+                            device.isOnline = true
+                            device.unreachableAlertMessage = nil
+                            device.unreachableTrigger = nil
+                        } else if !isRecent {
+                            device.consecutiveFailures += 1
+                            if device.consecutiveFailures >= 5 {
+                                device.isOnline = false
+                                device.isOn = false
+                            }
+                        }
+                    } else if pollCount % 24 == 0 && !AtombergCloudAdapter.shared.apiKey.isEmpty {
                         await AtombergCloudAdapter.shared.refreshState(device)
                     }
                 }

@@ -145,7 +145,7 @@ final class WiZAdapter {
                 }
                 defer { close(sock) }
 
-                var tv = timeval(tv_sec: 0, tv_usec: 650_000) // 650ms timeout
+                var tv = timeval(tv_sec: 1, tv_usec: 200_000) // Generous 1.2s timeout to accommodate 2.4GHz Wi-Fi
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
                 var addr = sockaddr_in()
@@ -154,20 +154,20 @@ final class WiZAdapter {
                 inet_pton(AF_INET, host, &addr.sin_addr)
 
                 let msg = WiZCommands.getPilot()
-                var bytesRead = 0
                 var buf = [UInt8](repeating: 0, count: 2048)
 
-                for _ in 0..<2 {
-                    _ = msg.withUnsafeBytes { rawBuffer in
-                        guard let ptr = rawBuffer.baseAddress else { return 0 }
-                        return withUnsafePointer(to: &addr) { sockaddrPtr in
-                            sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                                sendto(sock, ptr, msg.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                            }
+                let sent = msg.withUnsafeBytes { rawBuffer -> Int in
+                    guard let ptr = rawBuffer.baseAddress else { return -1 }
+                    return withUnsafePointer(to: &addr) { sockaddrPtr in
+                        sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            sendto(sock, ptr, msg.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                         }
                     }
+                }
+
+                var bytesRead = -1
+                if sent > 0 {
                     bytesRead = recv(sock, &buf, buf.count, 0)
-                    if bytesRead > 0 { break }
                 }
 
                 if bytesRead > 0 {
@@ -204,9 +204,10 @@ final class WiZAdapter {
                 DispatchQueue.main.async {
                     device.consecutiveFailures += 1
                     let isRecent = Date().timeIntervalSince(device.lastActionDate) < 4.0
-                    if device.consecutiveFailures >= 2 && !isRecent {
+                    // Require 5 consecutive failed pings (~25 seconds of silence) before declaring unreachable.
+                    // Never toggle device.isOn off on routine network jitter.
+                    if device.consecutiveFailures >= 5 && !isRecent {
                         device.isOnline = false
-                        device.isOn = false
                     }
                     continuation.resume()
                 }
