@@ -8,6 +8,7 @@ enum NetworkError: Error, LocalizedError {
     case encryptionError
     case authenticationFailed
     case deviceNotFound
+    case deviceUnreachable(String)
     case protocolError(String)
 
     var errorDescription: String? {
@@ -19,6 +20,7 @@ enum NetworkError: Error, LocalizedError {
         case .encryptionError: return "Encryption error"
         case .authenticationFailed: return "Authentication failed"
         case .deviceNotFound: return "Device not found"
+        case .deviceUnreachable(let msg): return "Device unreachable: \(msg)"
         case .protocolError(let msg): return "Protocol error: \(msg)"
         }
     }

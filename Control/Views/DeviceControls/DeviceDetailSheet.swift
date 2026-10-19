@@ -6,6 +6,19 @@ struct DeviceDetailSheet: View {
     var onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showConfirmDelete = false
+    @State private var isRenaming: Bool = false
+    @State private var editedName: String = ""
+    @FocusState private var isNameFocused: Bool
+
+    private func commitRename() {
+        let trimmed = editedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != device.name {
+            device.name = trimmed
+            DeviceManager.shared.saveDevices()
+            HapticFeedback.snap()
+        }
+        isRenaming = false
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,8 +30,44 @@ struct DeviceDetailSheet: View {
                         .foregroundColor(device.brand.color)
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(device.name)
-                            .font(.title2.bold())
+                        if isRenaming {
+                            HStack(spacing: 6) {
+                                TextField("Name", text: $editedName)
+                                    .font(.title2.bold())
+                                    .textFieldStyle(.plain)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color(nsColor: .controlBackgroundColor))
+                                    .cornerRadius(6)
+                                    .focused($isNameFocused)
+                                    .onSubmit { commitRename() }
+
+                                Button { commitRename() } label: {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                        .font(.title3)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        } else {
+                            HStack(spacing: 6) {
+                                Text(device.name)
+                                    .font(.title2.bold())
+                                Image(systemName: "pencil")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                editedName = device.name
+                                isRenaming = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                    isNameFocused = true
+                                }
+                            }
+                            .help("Click to rename device")
+                        }
+
                         Text("\(device.brand.rawValue) · \(device.ipAddress)")
                             .font(.caption)
                             .foregroundColor(.secondary)

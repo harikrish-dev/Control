@@ -14,12 +14,14 @@ import argparse
 import subprocess
 import urllib.request
 import urllib.error
+import time
 from pathlib import Path
 
 # User Storage Paths - Purely stored in local macOS Application Support (outside git repo)
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "Control"
 DEVICES_FILE = APP_SUPPORT_DIR / "devices.json"
 SCENES_FILE = APP_SUPPORT_DIR / "scenes.json"
+ATOMBERG_TOKEN_CACHE = APP_SUPPORT_DIR / "atomberg_token.json"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
@@ -329,6 +331,15 @@ def control_wiz_light(dev, action, value=None, extra=None):
 ATOMBERG_BASE = "https://api.developer.atomberg-iot.com"
 
 def get_atomberg_access_token(api_key, refresh_token):
+    if ATOMBERG_TOKEN_CACHE.exists():
+        try:
+            with open(ATOMBERG_TOKEN_CACHE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+                if cached.get("api_key") == api_key and cached.get("expires_at", 0) > time.time():
+                    return cached.get("access_token")
+        except Exception:
+            pass
+
     url = f"{ATOMBERG_BASE}/v1/get_access_token"
     req = urllib.request.Request(url, headers={
         "X-API-Key": api_key,
@@ -339,9 +350,26 @@ def get_atomberg_access_token(api_key, refresh_token):
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-            return data.get("message", {}).get("access_token") or data.get("access_token")
+            token = data.get("message", {}).get("access_token") or data.get("access_token")
+            if token:
+                try:
+                    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(ATOMBERG_TOKEN_CACHE, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "api_key": api_key,
+                            "access_token": token,
+                            "expires_at": time.time() + (23 * 3600)
+                        }, f)
+                except Exception:
+                    pass
+            return token
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            pass # rate limited, token will fallback gracefully
+        else:
+            log_err(f"Atomberg Cloud auth error: HTTP {e.code}")
+        return None
     except Exception as e:
-        log_err(f"Failed to authenticate with Atomberg Cloud: {e}")
         return None
 
 def sync_atomberg_fans(custom_name=None):
@@ -685,6 +713,177 @@ def dispatch_to_device(dev, action, args):
         return False
 
 # ==========================================
+# Device Renaming
+# ==========================================
+def rename_device(query, new_name):
+    query = query.strip()
+    new_name = new_name.strip()
+    if not query or not new_name:
+        log_err("Usage: control rename <device_name_or_id> <new_name>")
+        return False
+
+    devices = load_devices()
+    dev, ambiguous = match_device(query, devices)
+    if not dev:
+        if ambiguous:
+            log_err(f"Ambiguous name '{query}'. Multiple devices found:")
+            for d in ambiguous:
+                print(f"  • {d.get('name')} (ID: {d.get('id')})")
+            return False
+        log_err(f"No device found matching '{query}'. Run 'control names' to see available devices.")
+        return False
+
+    old_name = dev.get("name", "Unknown")
+    dev["name"] = new_name
+    if save_devices_to_disk(devices):
+        log_ok(f"Renamed '{BOLD}{old_name}{RESET}' to '{BOLD}{GREEN}{new_name}{RESET}'")
+        first_call = new_name.split()[0].lower() if " " in new_name else new_name.lower()
+        print(f"💡 You can now control it with: {CYAN}control '{new_name}' on{RESET} or {CYAN}control {first_call} on{RESET}")
+        return True
+    return False
+
+# ==========================================
+# Network & Device Resynchronization
+# ==========================================
+def resync_all_devices():
+    devices = load_devices()
+    if not devices:
+        log_warn("No devices configured. Run 'control add' to connect devices.")
+        return
+
+    print(f"\n{BOLD}🔄 Resyncing all smart home appliances...{RESET}\n")
+    online_count = 0
+    total_count = len(devices)
+
+    for dev in devices:
+        dev_type = dev.get("type", "").lower()
+        dev_name = dev.get("name", "Unknown")
+        brand = dev.get("brand", "").capitalize()
+
+        if dev_type == "light":
+            ip = dev.get("ipAddress", "")
+            pilot = wiz_get_pilot(ip) if ip and ip != "cloud" else None
+            if pilot:
+                online_count += 1
+                dev["isOnline"] = True
+                dev["isOn"] = bool(pilot.get("state", False))
+                if "dimming" in pilot:
+                    dev["brightness"] = pilot["dimming"]
+                if "temp" in pilot:
+                    dev["colorTemperature"] = pilot["temp"]
+                if "r" in pilot and "g" in pilot and "b" in pilot:
+                    dev["red"] = pilot["r"]
+                    dev["green"] = pilot["g"]
+                    dev["blue"] = pilot["b"]
+                st = f"{GREEN}ON{RESET}" if dev["isOn"] else f"{RED}OFF{RESET}"
+                print(f"  💡 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} • State: {st} • Brightness: {dev.get('brightness', 100)}% [IP: {ip}]")
+            else:
+                dev["isOnline"] = False
+                dev["isOn"] = False
+                print(f"  💡 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Wall switch is OFF or disconnected [IP: {ip}]")
+
+        elif dev_type == "fan":
+            dev_id = resolve_fan_device_id(dev)
+            api_key = get_preference("atomberg_api_key")
+            refresh_token = get_preference("atomberg_refresh_token")
+            synced = False
+            if api_key and refresh_token:
+                token = get_atomberg_access_token(api_key, refresh_token)
+                if token:
+                    try:
+                        req = urllib.request.Request(
+                            f"{ATOMBERG_BASE}/v1/get_device_state?device_id={dev_id}",
+                            headers={"X-API-Key": api_key, "Authorization": f"Bearer {token}", "Accept": "application/json"}
+                        )
+                        with urllib.request.urlopen(req, timeout=3.0) as resp:
+                            data = json.loads(resp.read().decode())
+                            states = data.get("message", {}).get("device_state", [])
+                            if states:
+                                s = states[0]
+                                is_online = bool(s.get("is_online", True))
+                                dev["isOnline"] = is_online
+                                if is_online:
+                                    online_count += 1
+                                    dev["isOn"] = bool(s.get("power", False))
+                                    dev["speed"] = s.get("last_recorded_speed") or s.get("speed", 3)
+                                    st = f"{GREEN}ON{RESET}" if dev["isOn"] else f"{RED}OFF{RESET}"
+                                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} • State: {st} • Speed: {dev['speed']}/6")
+                                else:
+                                    dev["isOn"] = False
+                                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {YELLOW}OFFLINE{RESET} • Fan is disconnected or wall switch is OFF")
+                                synced = True
+                    except Exception:
+                        pass
+            if not synced:
+                ip = dev.get("ipAddress", "")
+                if ip and ip != "cloud":
+                    online_count += 1
+                    dev["isOnline"] = True
+                    st = f"{GREEN}ON{RESET}" if dev.get("isOn") else f"{RED}OFF{RESET}"
+                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} (Local) • State: {st} • Speed: {dev.get('speed', 3)}/6 [IP: {ip}]")
+                else:
+                    dev["isOnline"] = False
+                    print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {YELLOW}OFFLINE{RESET} • Atomberg Cloud is currently unreachable")
+
+        elif dev_type == "plug":
+            dev_id = dev.get("tuyaDeviceId") or dev.get("id")
+            region = get_preference("tuya_region") or "in"
+            access_id = get_preference("tuya_access_id")
+            access_secret = get_preference("tuya_access_secret")
+            synced = False
+            if access_id and access_secret and dev_id:
+                try:
+                    res = subprocess.run(
+                        [sys.executable, str(TUYA_HELPER), "status", region, access_id, access_secret, dev_id],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if res.returncode == 0:
+                        data = json.loads(res.stdout)
+                        if data.get("success") is not False:
+                            result_items = data.get("result", [])
+                            if result_items:
+                                dev["isOnline"] = True
+                                online_count += 1
+                                synced = True
+                                sockets = {}
+                                pwr = None
+                                for item in result_items:
+                                    code = item.get("code", "")
+                                    val = item.get("value")
+                                    if code.startswith("switch_"):
+                                        try:
+                                            s_idx = int(code.replace("switch_", ""))
+                                            sockets[s_idx] = bool(val)
+                                            if s_idx <= len(dev.get("socketStates", [])):
+                                                dev["socketStates"][s_idx - 1] = bool(val)
+                                        except ValueError:
+                                            pass
+                                    elif code in ["cur_power", "power"]:
+                                        pwr = float(val) / 10.0 if val else 0.0
+                                        dev["currentPower"] = pwr
+                                    elif code in ["cur_voltage", "voltage"]:
+                                        dev["currentVoltage"] = float(val) / 10.0 if val else 0.0
+                                    elif code in ["cur_current", "current"]:
+                                        dev["currentCurrent"] = float(val) / 1000.0 if val else 0.0
+
+                                dev["isOn"] = any(dev.get("socketStates", []))
+                                sock_str = " ".join([f"S{k}:{'ON' if v else 'OFF'}" for k, v in sorted(sockets.items())])
+                                pwr_str = f" • {pwr:.1f}W" if pwr is not None else ""
+                                print(f"  🔌 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} • {sock_str}{pwr_str}")
+                except Exception:
+                    pass
+            if not synced:
+                dev["isOnline"] = False
+                print(f"  🔌 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Strip is offline or main power switch is OFF")
+
+    save_devices_to_disk(devices)
+    unreachable_count = total_count - online_count
+    status_summary = f"{GREEN}{online_count} online{RESET}"
+    if unreachable_count > 0:
+        status_summary += f", {RED}{unreachable_count} unreachable (switch OFF){RESET}"
+    print(f"\n{BOLD}Resync Complete:{RESET} {status_summary}\n")
+
+# ==========================================
 # Device Removal
 # ==========================================
 def remove_device(query):
@@ -847,7 +1046,7 @@ def list_devices():
                 temp_str = f" • {temp}K" if temp else ""
                 print(f"   Status: {pwr} • Brightness: {dim}%{temp_str} • IP: {ip}")
             else:
-                print(f"   Status: {YELLOW}Reachable{RESET} • IP: {ip}")
+                print(f"   Status: {RED}Unreachable{RESET} (Wall switch is OFF or disconnected) • IP: {ip}")
 
         elif dev_type == "fan":
             dev_id = resolve_fan_device_id(dev)
@@ -1029,6 +1228,8 @@ def main():
   control add light <ip> [name]     Connect WiZ Light at specified IP (e.g. 192.168.1.50)
   control add fan [name]            Sync and connect fans from Atomberg Cloud
   control add plug <id> [name]      Connect Homemate / Tuya plug or strip with device ID
+  control rename <device> <new>     Rename any device (e.g. control rename "WiZ Light" "Desk Lamp")
+  control resync / sync / refresh   Query live state & online/offline reachability across all devices
   control scan / discover           Scan local Wi-Fi and accounts for new devices
   control remove / delete <name>    Disconnect and remove a device by name
 
@@ -1050,7 +1251,22 @@ def main():
 
     first_arg = sys.argv[1].lower()
 
-    if first_arg in ["names", "name", "tags", "aliases"]:
+    if first_arg in ["resync", "sync", "refresh"]:
+        resync_all_devices()
+        return
+    elif first_arg in ["rename", "set-name"]:
+        if len(sys.argv) < 4:
+            log_err("Usage: control rename <device_name_or_id> <new_name>")
+            print("Example: control rename 'WiZ Light' 'Desk Lamp'")
+            return
+        target = sys.argv[2]
+        new_name = " ".join(sys.argv[3:])
+        rename_device(target, new_name)
+        return
+    elif first_arg in ["status"] and len(sys.argv) == 2:
+        list_devices()
+        return
+    elif first_arg in ["names", "name", "tags", "aliases"] and len(sys.argv) == 2:
         list_device_names()
         return
     elif first_arg in ["list", "devices"]:

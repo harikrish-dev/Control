@@ -229,21 +229,31 @@ final class AtombergCloudAdapter {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                 request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-                _ = try? await URLSession.shared.data(for: request)
+                let (_, resp) = try await URLSession.shared.data(for: request)
+                if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                    device.isOnline = false
+                    device.isOn = false
+                    device.triggerUnreachableAlert(reason: "Fan is unreachable. Check wall switch or Wi-Fi.")
+                    throw NetworkError.deviceUnreachable("Fan command failed with HTTP \(http.statusCode)")
+                }
+                device.isOnline = true
             } catch {
-                print("Atomberg send error: \(error)")
+                device.isOnline = false
+                device.isOn = false
+                device.triggerUnreachableAlert(reason: "Fan is unreachable. Check wall switch or Wi-Fi.")
+                throw error
             }
-        }
 
-        // Update local state
-        switch command {
-        case .power(let on): device.isOn = on
-        case .fanSpeed(let speed): device.speed = speed; device.isOn = true; device.isBoostMode = false
-        case .fanBoost(let boost): device.isBoostMode = boost; if boost { device.speed = 6; device.isOn = true }
-        case .fanSleep(let sleep): device.isSleepMode = sleep
-        case .fanLed(let led): device.isLedOn = led
-        case .fanTimer(let minutes): device.timerMinutes = minutes
-        default: break
+            // Update local state only on success
+            switch command {
+            case .power(let on): device.isOn = on
+            case .fanSpeed(let speed): device.speed = speed; device.isOn = true; device.isBoostMode = false
+            case .fanBoost(let boost): device.isBoostMode = boost; if boost { device.speed = 6; device.isOn = true }
+            case .fanSleep(let sleep): device.isSleepMode = sleep
+            case .fanLed(let led): device.isLedOn = led
+            case .fanTimer(let minutes): device.timerMinutes = minutes
+            default: break
+            }
         }
     }
 

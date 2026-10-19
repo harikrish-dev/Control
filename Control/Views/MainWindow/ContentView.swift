@@ -122,11 +122,17 @@ struct ContentView: View {
             AddDeviceSheet(manager: manager)
         }
         .frame(minWidth: 840, minHeight: 540)
+        .task {
+            await manager.refreshAllDevices()
+        }
 
             if showSplash {
                 AppLoadingSplashView {
                     withAnimation(.easeOut(duration: 0.45)) {
                         showSplash = false
+                    }
+                    Task {
+                        await manager.refreshAllDevices()
                     }
                 }
                 .transition(.opacity)

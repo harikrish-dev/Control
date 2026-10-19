@@ -46,10 +46,59 @@ final class WiZAdapter {
         default: return
         }
 
-        if !device.ipAddress.isEmpty {
-            Self.sendRawUDP(data: data, to: device.ipAddress, port: wizPort)
+        guard !device.ipAddress.isEmpty, device.ipAddress != "cloud" else {
+            device.triggerUnreachableAlert(reason: "No IP address configured")
+            throw NetworkError.deviceUnreachable("No IP address configured")
         }
 
+        let host = device.ipAddress
+        let port = wizPort
+
+        // Send UDP command and verify response from the physical bulb
+        let success = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                let sock = socket(AF_INET, SOCK_DGRAM, 0)
+                guard sock >= 0 else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                defer { close(sock) }
+
+                var tv = timeval(tv_sec: 0, tv_usec: 650_000) // 650ms timeout
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+                var addr = sockaddr_in()
+                addr.sin_family = sa_family_t(AF_INET)
+                addr.sin_port = port.bigEndian
+                inet_pton(AF_INET, host, &addr.sin_addr)
+
+                let sent = data.withUnsafeBytes { rawBuffer -> Int in
+                    guard let ptr = rawBuffer.baseAddress else { return -1 }
+                    return withUnsafePointer(to: &addr) { sockaddrPtr in
+                        sockaddrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            sendto(sock, ptr, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+                guard sent > 0 else {
+                    continuation.resume(returning: false)
+                    return
+                }
+
+                var buf = [UInt8](repeating: 0, count: 2048)
+                let bytesRead = recv(sock, &buf, buf.count, 0)
+                continuation.resume(returning: bytesRead > 0)
+            }
+        }
+
+        if !success {
+            device.isOnline = false
+            device.isOn = false
+            device.triggerUnreachableAlert(reason: "Wall switch is OFF. Turn on switch to power light.")
+            throw NetworkError.deviceUnreachable("Wall switch is OFF or light is disconnected")
+        }
+
+        device.isOnline = true
         switch command {
         case .power(let on): device.isOn = on
         case .brightness(let level): device.brightness = level; device.isOn = true
@@ -75,7 +124,7 @@ final class WiZAdapter {
                 }
                 defer { close(sock) }
 
-                var tv = timeval(tv_sec: 1, tv_usec: 0)
+                var tv = timeval(tv_sec: 0, tv_usec: 800_000) // 800ms timeout
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
                 var addr = sockaddr_in()
@@ -123,6 +172,8 @@ final class WiZAdapter {
                     }
                 }
                 DispatchQueue.main.async {
+                    device.isOnline = false
+                    device.isOn = false
                     continuation.resume()
                 }
             }
@@ -143,7 +194,7 @@ final class WiZAdapter {
                 type: .light,
                 ipAddress: candidate.ip
             )
-            dev.isOnline = true
+            dev.isOnline = false
             await refreshState(dev)
             devices.append(dev)
         }

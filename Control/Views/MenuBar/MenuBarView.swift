@@ -227,10 +227,18 @@ struct MenuBarDeviceRow: View {
 
     @State private var isRowHovered: Bool = false
     @State private var isExpanded: Bool = false
+    @State private var isRenaming: Bool = false
+    @State private var editedName: String = ""
+    @FocusState private var isNameFocused: Bool
+    @State private var shakeOffset: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 10) {
             headerRow
+
+            if let alertMsg = device.unreachableAlertMessage {
+                unreachableAlertPill(msg: alertMsg)
+            }
 
             // If expanded: show all rich options for that device
             if isExpanded {
@@ -242,41 +250,200 @@ struct MenuBarDeviceRow: View {
             }
         }
         .padding(14)
+        .offset(x: shakeOffset)
         .background(
             DeviceAnimatedBackground(device: device, cornerRadius: 14, isDarkTheme: true, isHovered: isRowHovered)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(device.isOn ? device.brand.color.opacity(0.4) : Color.white.opacity(0.08), lineWidth: 1)
+                .stroke(
+                    !device.isOnline
+                        ? device.unreachableColor.opacity(0.4)
+                        : (device.isOn ? device.brand.color.opacity(0.4) : Color.white.opacity(0.08)),
+                    lineWidth: 1
+                )
         )
         .onHover { hovering in
             isRowHovered = hovering
         }
+        .onChange(of: device.unreachableTrigger) { _, _ in
+            triggerShakeAnimation()
+        }
+        .contextMenu {
+            Button {
+                startRename()
+            } label: {
+                Label("Rename Device", systemImage: "pencil")
+            }
+        }
+    }
+
+    private func togglePower() {
+        if !device.isOnline {
+            device.triggerUnreachableAlert()
+            return
+        }
+        HapticFeedback.click()
+        device.lastActionDate = Date()
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+            onCommand(.power(!device.isOn))
+        }
+    }
+
+    private func startRename() {
+        editedName = device.name
+        isRenaming = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            isNameFocused = true
+        }
+    }
+
+    private func commitRename() {
+        let trimmed = editedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != device.name {
+            device.name = trimmed
+            DeviceManager.shared.saveDevices()
+            HapticFeedback.snap()
+        }
+        isRenaming = false
+    }
+
+    private func triggerShakeAnimation() {
+        withAnimation(.spring(response: 0.10, dampingFraction: 0.2)) {
+            shakeOffset = 6
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+            withAnimation(.spring(response: 0.10, dampingFraction: 0.2)) {
+                shakeOffset = -6
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+            withAnimation(.spring(response: 0.12, dampingFraction: 0.25)) {
+                shakeOffset = 4
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) {
+            withAnimation(.spring(response: 0.15, dampingFraction: 0.4)) {
+                shakeOffset = 0
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func unreachableAlertPill(msg: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: device.unreachableIcon)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(device.unreachableColor)
+                .symbolEffect(.bounce, value: device.unreachableTrigger)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(device.unreachableTitle)
+                    .font(.system(size: 11, weight: .heavy, design: .rounded))
+                    .foregroundColor(.white)
+                Text(msg)
+                    .font(.system(size: 9.5))
+                    .foregroundColor(Color.white.opacity(0.85))
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(red: 0.12, green: 0.08, blue: 0.10).opacity(0.98))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(device.unreachableColor.opacity(0.8), lineWidth: 1)
+        )
+        .transition(.scale(scale: 0.95).combined(with: .opacity))
     }
 
     private var headerRow: some View {
         HStack(spacing: 10) {
             // Left Button (Animated Icon + Quick Power Toggle)
             Button {
-                HapticFeedback.click()
-                device.lastActionDate = Date()
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                    onCommand(.power(!device.isOn))
-                }
+                togglePower()
             } label: {
                 DeviceIconView(device: device, size: 36)
             }
             .buttonStyle(.plain)
             .focusable(false)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(device.name)
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                Text(device.statusText)
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.white.opacity(0.5))
+            if isRenaming {
+                HStack(spacing: 4) {
+                    TextField("Device Name", text: $editedName)
+                        .font(.system(size: 12, weight: .bold))
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.12))
+                        .cornerRadius(6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(device.brand.color, lineWidth: 1)
+                        )
+                        .focused($isNameFocused)
+                        .onSubmit {
+                            commitRename()
+                        }
+                        .onExitCommand {
+                            isRenaming = false
+                        }
+
+                    Button {
+                        commitRename()
+                    } label: {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundColor(.green)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        isRenaming = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 5) {
+                        Text(device.name)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+
+                        Image(systemName: "pencil")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color.white.opacity(0.35))
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        startRename()
+                    }
+                    .help("Click to rename device")
+
+                    HStack(spacing: 4) {
+                        if !device.isOnline {
+                            Circle()
+                                .fill(device.unreachableColor)
+                                .frame(width: 4.5, height: 4.5)
+                            Text(device.statusText)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(device.unreachableColor)
+                        } else {
+                            Text(device.statusText)
+                                .font(.system(size: 11))
+                                .foregroundColor(Color.white.opacity(0.5))
+                        }
+                    }
+                }
             }
 
             Spacer()
@@ -302,20 +469,18 @@ struct MenuBarDeviceRow: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            HapticFeedback.click()
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
-                isExpanded.toggle()
+            if !isRenaming {
+                HapticFeedback.click()
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                    isExpanded.toggle()
+                }
             }
         }
     }
 
     private var powerButton: some View {
         Button {
-            HapticFeedback.click()
-            device.lastActionDate = Date()
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                onCommand(.power(!device.isOn))
-            }
+            togglePower()
         } label: {
             Image(systemName: "power")
                 .font(.system(size: 12, weight: .bold))

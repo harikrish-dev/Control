@@ -161,34 +161,43 @@ final class DeviceManager {
     func sendCommand(_ command: DeviceCommand, to device: SmartDevice) {
         device.lastActionDate = Date()
         Task {
-            switch device.brand {
-            case .wiz:
-                try? await wizAdapter.sendCommand(command, to: device)
-            case .atomberg:
-                let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
-                if hasLocalIP {
-                    do {
-                        try await AtombergLocalAdapter.shared.sendCommand(command, to: device)
-                    } catch {
-                        if !AtombergCloudAdapter.shared.apiKey.isEmpty {
-                            try? await AtombergCloudAdapter.shared.sendCommand(command, to: device)
+            do {
+                switch device.brand {
+                case .wiz:
+                    try await wizAdapter.sendCommand(command, to: device)
+                case .atomberg:
+                    let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
+                    if hasLocalIP {
+                        do {
+                            try await AtombergLocalAdapter.shared.sendCommand(command, to: device)
+                        } catch {
+                            if !AtombergCloudAdapter.shared.apiKey.isEmpty {
+                                try await AtombergCloudAdapter.shared.sendCommand(command, to: device)
+                            } else {
+                                throw error
+                            }
                         }
+                    } else if !AtombergCloudAdapter.shared.apiKey.isEmpty {
+                        try await AtombergCloudAdapter.shared.sendCommand(command, to: device)
+                    } else {
+                        try await AtombergLocalAdapter.shared.sendCommand(command, to: device)
                     }
-                } else if !AtombergCloudAdapter.shared.apiKey.isEmpty {
-                    try? await AtombergCloudAdapter.shared.sendCommand(command, to: device)
-                } else {
-                    // Try local discovery fallback
-                    try? await AtombergLocalAdapter.shared.sendCommand(command, to: device)
+                case .homemate:
+                    try await tuyaAdapter.sendCommand(command, to: device)
+                case .carrier:
+                    try await mideaAdapter.sendCommand(command, to: device)
                 }
-            case .homemate:
-                try? await tuyaAdapter.sendCommand(command, to: device)
-            case .carrier:
-                try? await mideaAdapter.sendCommand(command, to: device)
+            } catch {
+                device.triggerUnreachableAlert()
             }
         }
     }
 
     func toggleDevice(_ device: SmartDevice) {
+        if !device.isOnline {
+            device.triggerUnreachableAlert()
+            return
+        }
         device.lastActionDate = Date()
         sendCommand(.power(!device.isOn), to: device)
     }
@@ -457,7 +466,10 @@ final class DeviceManager {
             guard !device.tuyaDeviceId.isEmpty else { continue }
             let telemetry = await TuyaCloudBridge.shared.fetchDeviceTelemetry(deviceId: device.tuyaDeviceId)
             let states = telemetry.socketStates
-            guard !states.isEmpty || telemetry.voltage != nil || telemetry.power != nil else { continue }
+            guard !states.isEmpty || telemetry.voltage != nil || telemetry.power != nil else {
+                device.isOnline = false
+                continue
+            }
 
             let now = Date()
             for (socketIdx, isOn) in states {

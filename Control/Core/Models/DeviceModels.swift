@@ -16,6 +16,11 @@ class SmartDevice: Identifiable, Hashable {
     var lastActionDate: Date = Date.distantPast
     var isFavorite: Bool = false
 
+    // Unreachable / Offline Warning State
+    var unreachableAlertMessage: String? = nil
+    var unreachableTrigger: UUID? = nil
+    private var alertResetTask: Task<Void, Never>? = nil
+
     // Light properties
     var brightness: Int = 100
     var colorTemperature: Int = 4000
@@ -73,6 +78,59 @@ class SmartDevice: Identifiable, Hashable {
         self.ipAddress = ipAddress
     }
 
+    var unreachableTitle: String {
+        switch type {
+        case .light: return "Switch is OFF"
+        case .fan: return "Fan Offline"
+        case .plug: return "Strip Offline"
+        case .airConditioner: return "AC Unreachable"
+        }
+    }
+
+    var unreachableSubtitle: String {
+        switch type {
+        case .light: return "Turn on wall switch to power light"
+        case .fan: return "Check wall switch or Wi-Fi"
+        case .plug: return "Main power switch is off or disconnected"
+        case .airConditioner: return "Unit powered off or no signal"
+        }
+    }
+
+    var unreachableIcon: String {
+        switch type {
+        case .light: return "lightbulb.slash.fill"
+        case .fan: return "fan.slash.fill"
+        case .plug: return "powerplug.fill"
+        case .airConditioner: return "snowflake.slash"
+        }
+    }
+
+    var unreachableColor: Color {
+        switch type {
+        case .light: return Color(red: 1.0, green: 0.55, blue: 0.15) // Warm amber warning
+        case .fan: return Color(red: 0.2, green: 0.75, blue: 0.95)   // Cyan warning
+        case .plug: return Color(red: 0.95, green: 0.3, blue: 0.4)   // Red alert
+        case .airConditioner: return Color(red: 0.3, green: 0.7, blue: 1.0)
+        }
+    }
+
+    func triggerUnreachableAlert(reason: String? = nil) {
+        self.isOnline = false
+        self.isOn = false
+        self.unreachableAlertMessage = reason ?? unreachableSubtitle
+        self.unreachableTrigger = UUID()
+
+        alertResetTask?.cancel()
+        alertResetTask = Task {
+            try? await Task.sleep(nanoseconds: 3_200_000_000)
+            if !Task.isCancelled {
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    self.unreachableAlertMessage = nil
+                }
+            }
+        }
+    }
+
     func setSocketStateOptimistic(socketIndex: Int, isOn: Bool) {
         if socketIndex >= 1 && socketIndex <= socketStates.count {
             socketStates[socketIndex - 1] = isOn
@@ -107,6 +165,14 @@ class SmartDevice: Identifiable, Hashable {
     }
 
     var statusText: String {
+        if !isOnline {
+            switch type {
+            case .light: return "Switch OFF"
+            case .fan: return "Offline"
+            case .plug: return "Offline"
+            case .airConditioner: return "Unreachable"
+            }
+        }
         guard isOn else { return "Off" }
         switch type {
         case .light: return "\(brightness)%"
@@ -202,7 +268,7 @@ struct SavedDevice: Codable {
         dev.currentPower = currentPower
         dev.currentVoltage = currentVoltage
         dev.currentCurrent = currentCurrent
-        dev.isOnline = true
+        dev.isOnline = false
         return dev
     }
 }

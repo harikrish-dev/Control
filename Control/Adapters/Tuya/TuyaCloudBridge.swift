@@ -235,8 +235,12 @@ final class TuyaCloudBridge {
                 try? process.run()
                 process.waitUntilExit()
 
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                let ok = process.terminationStatus == 0 && (output.contains("\"success\": true") || output.contains("true"))
+
                 DispatchQueue.main.async {
-                    continuation.resume(returning: process.terminationStatus == 0)
+                    continuation.resume(returning: ok)
                 }
             }
         }
@@ -271,8 +275,12 @@ final class TuyaCloudBridge {
                 try? process.run()
                 process.waitUntilExit()
 
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                let ok = process.terminationStatus == 0 && (output.contains("\"success\": true") || output.contains("true"))
+
                 DispatchQueue.main.async {
-                    continuation.resume(returning: process.terminationStatus == 0)
+                    continuation.resume(returning: ok)
                 }
             }
         }
