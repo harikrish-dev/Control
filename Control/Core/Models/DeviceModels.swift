@@ -19,6 +19,7 @@ class SmartDevice: Identifiable, Hashable {
     // Unreachable / Offline Warning State
     var unreachableAlertMessage: String? = nil
     var unreachableTrigger: UUID? = nil
+    var consecutiveFailures: Int = 0
     private var alertResetTask: Task<Void, Never>? = nil
 
     // Light properties

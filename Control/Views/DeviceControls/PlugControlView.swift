@@ -43,7 +43,7 @@ struct PlugControlView: View {
                         .foregroundColor(!device.isOnline ? device.unreachableColor : .secondary)
                 }
                 Spacer()
-                PowerButton(isOn: device.isOn) {
+                PowerButton(isOn: device.isOnline && device.isOn) {
                     if !device.isOnline {
                         device.triggerUnreachableAlert()
                         return
@@ -54,7 +54,7 @@ struct PlugControlView: View {
                 }
             }
             .padding()
-            .background(device.isOnline ? Color.green.opacity(0.1) : Color.secondary.opacity(0.08))
+            .background((device.isOnline && device.isOn) ? Color.green.opacity(0.1) : Color.secondary.opacity(0.08))
             .cornerRadius(14)
 
             // 4 Individual Sockets Grid

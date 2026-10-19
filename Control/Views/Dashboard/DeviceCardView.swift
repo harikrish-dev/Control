@@ -27,7 +27,7 @@ struct DeviceCardView: View {
 
                 Spacer()
 
-                PowerButton(isOn: device.isOn, action: onToggle)
+                PowerButton(isOn: device.isOnline && device.isOn, action: onToggle)
             }
 
             VStack(alignment: .leading, spacing: 5) {

@@ -74,8 +74,12 @@ struct DeviceDetailSheet: View {
                     }
                 }
                 Spacer()
-                PowerButton(isOn: device.isOn) {
-                    onCommand(.power(!device.isOn))
+                PowerButton(isOn: device.isOnline && device.isOn) {
+                    if !device.isOnline {
+                        device.triggerUnreachableAlert()
+                    } else {
+                        onCommand(.power(!device.isOn))
+                    }
                 }
                 Button {
                     dismiss()

@@ -138,10 +138,15 @@ final class TuyaCloudBridge {
                 let pipe = Pipe()
                 process.standardOutput = pipe
                 process.standardError = Pipe()
-                try? process.run()
-                process.waitUntilExit()
+                do {
+                    try process.run()
+                } catch {
+                    DispatchQueue.main.async { continuation.resume(returning: TuyaDeviceTelemetry()) }
+                    return
+                }
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 var telemetry = TuyaDeviceTelemetry()
 
                 guard let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
@@ -239,10 +244,15 @@ final class TuyaCloudBridge {
                 let pipe = Pipe()
                 process.standardOutput = pipe
                 process.standardError = Pipe()
-                try? process.run()
-                process.waitUntilExit()
+                do {
+                    try process.run()
+                } catch {
+                    DispatchQueue.main.async { continuation.resume(returning: false) }
+                    return
+                }
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 let output = String(data: data, encoding: .utf8) ?? ""
                 var ok = process.terminationStatus == 0
                 if let jsonStart = output.firstIndex(of: "{"),
@@ -293,10 +303,15 @@ final class TuyaCloudBridge {
                 let pipe = Pipe()
                 process.standardOutput = pipe
                 process.standardError = Pipe()
-                try? process.run()
-                process.waitUntilExit()
+                do {
+                    try process.run()
+                } catch {
+                    DispatchQueue.main.async { continuation.resume(returning: false) }
+                    return
+                }
 
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 let output = String(data: data, encoding: .utf8) ?? ""
                 var ok = process.terminationStatus == 0
                 if let jsonStart = output.firstIndex(of: "{"),

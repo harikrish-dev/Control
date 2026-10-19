@@ -51,6 +51,24 @@ final class WiZAdapter {
             throw NetworkError.deviceUnreachable("No IP address configured")
         }
 
+        // Save previous state for rollback if unreachable
+        let prevOn = device.isOn
+        let prevBrightness = device.brightness
+        let prevTemp = device.colorTemperature
+        let prevScene = device.currentScene
+        let prevR = device.red, prevG = device.green, prevB = device.blue
+
+        // Optimistic UI update: apply immediately so controls respond with zero lag
+        switch command {
+        case .power(let on): device.isOn = on
+        case .brightness(let level): device.brightness = level; device.isOn = true
+        case .colorTemperature(let kelvin): device.colorTemperature = kelvin; device.isOn = true
+        case .rgb(let r, let g, let b): device.red = r; device.green = g; device.blue = b; device.isOn = true
+        case .scene(let name): device.currentScene = name; device.isOn = true
+        default: break
+        }
+        device.lastActionDate = Date()
+
         let host = device.ipAddress
         let port = wizPort
 
@@ -64,7 +82,7 @@ final class WiZAdapter {
                 }
                 defer { close(sock) }
 
-                var tv = timeval(tv_sec: 0, tv_usec: 700_000) // 700ms timeout
+                var tv = timeval(tv_sec: 0, tv_usec: 650_000) // 650ms timeout
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
                 var addr = sockaddr_in()
@@ -94,23 +112,22 @@ final class WiZAdapter {
         }
 
         if !success {
+            // Revert state if physical bulb is unpowered / unreachable
+            device.isOn = prevOn
+            device.brightness = prevBrightness
+            device.colorTemperature = prevTemp
+            device.currentScene = prevScene
+            device.red = prevR; device.green = prevG; device.blue = prevB
             device.isOnline = false
-            device.isOn = false
+            device.consecutiveFailures += 1
             device.triggerUnreachableAlert(reason: "Wall switch is OFF. Turn on switch to power light.")
             throw NetworkError.deviceUnreachable("Wall switch is OFF or light is disconnected")
         }
 
+        device.consecutiveFailures = 0
         device.isOnline = true
         device.unreachableAlertMessage = nil
         device.unreachableTrigger = nil
-        switch command {
-        case .power(let on): device.isOn = on
-        case .brightness(let level): device.brightness = level; device.isOn = true
-        case .colorTemperature(let kelvin): device.colorTemperature = kelvin; device.isOn = true
-        case .rgb(let r, let g, let b): device.red = r; device.green = g; device.blue = b; device.isOn = true
-        case .scene(let name): device.currentScene = name; device.isOn = true
-        default: break
-        }
     }
 
     func refreshState(_ device: SmartDevice) async {
@@ -128,7 +145,7 @@ final class WiZAdapter {
                 }
                 defer { close(sock) }
 
-                var tv = timeval(tv_sec: 0, tv_usec: 750_000) // 750ms timeout
+                var tv = timeval(tv_sec: 0, tv_usec: 650_000) // 650ms timeout
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
                 var addr = sockaddr_in()
@@ -158,7 +175,8 @@ final class WiZAdapter {
                     if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let result = json["result"] as? [String: Any] {
                         DispatchQueue.main.async {
-                            let isRecent = Date().timeIntervalSince(device.lastActionDate) < 3.0
+                            let isRecent = Date().timeIntervalSince(device.lastActionDate) < 4.0
+                            device.consecutiveFailures = 0
                             device.isOnline = true
                             device.unreachableAlertMessage = nil
                             device.unreachableTrigger = nil
@@ -182,9 +200,14 @@ final class WiZAdapter {
                         return
                     }
                 }
+
                 DispatchQueue.main.async {
-                    device.isOnline = false
-                    device.isOn = false
+                    device.consecutiveFailures += 1
+                    let isRecent = Date().timeIntervalSince(device.lastActionDate) < 4.0
+                    if device.consecutiveFailures >= 2 && !isRecent {
+                        device.isOnline = false
+                        device.isOn = false
+                    }
                     continuation.resume()
                 }
             }
