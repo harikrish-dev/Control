@@ -1,0 +1,25 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Compiled Application Bundle & Installers
+Control.app/
+*.dmg
+.dmg_staging/
+
+# User Personal Data & Configurations (Stored locally in ~/Library/Application Support)
+*.json
+*.plist
+config/
+data/
+*.log
+
+# macOS System Files
+.DS_Store
+*.swp
+*.tmp
+
+# User-specific IDE State
+.idea/
+*.xcuserstate
+xcuserdata/
