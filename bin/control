@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+"""
+Control CLI - Command line interface for Control smart home suite.
+Operates smart devices by specific name/tag (e.g. 'Flow', 'Desk Light', 'Ceiling Light'),
+connects/pairs new devices headlessly, scans local network & cloud accounts, and manages quick scenes.
+All configuration files are self-contained within the Control project directory.
+"""
+
+import sys
+import os
+import json
+import socket
+import argparse
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# User Storage Paths - Purely stored in local macOS Application Support (outside git repo)
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "Control"
+DEVICES_FILE = APP_SUPPORT_DIR / "devices.json"
+SCENES_FILE = APP_SUPPORT_DIR / "scenes.json"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+TUYA_HELPER = PROJECT_DIR / "tuya_helper.py"
+
+# ANSI Colors
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+# WiZ Scene Mapping
+WIZ_SCENES = {
+    "ocean": 1, "romance": 2, "sunset": 3, "party": 4, "fireplace": 5,
+    "cozy": 6, "forest": 7, "pastel": 8, "wake up": 9, "bedtime": 10,
+    "warm white": 11, "daylight": 12, "cool white": 13, "night light": 14,
+    "focus": 15, "relax": 16, "tv time": 18, "diwali": 32
+}
+
+def log_ok(msg):
+    print(f"{GREEN}✓{RESET} {msg}")
+
+def log_warn(msg):
+    print(f"{YELLOW}⚠{RESET} {msg}")
+
+def log_err(msg):
+    print(f"{RED}✗{RESET} {msg}")
+
+def log_info(msg):
+    print(f"{CYAN}ℹ{RESET} {msg}")
+
+def get_preference(key):
+    """Read stored preference from macOS defaults for com.harikrish.control"""
+    try:
+        res = subprocess.run(
+            ["defaults", "read", "com.harikrish.control", key],
+            capture_output=True, text=True, check=True
+        )
+        val = res.stdout.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1].strip()
+        return val
+    except Exception:
+        return ""
+
+def load_devices():
+    """Load devices from user private Application Support storage"""
+    if DEVICES_FILE.exists():
+        try:
+            with open(DEVICES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log_err(f"Failed to read devices.json: {e}")
+    return []
+
+def save_devices_to_disk(devices):
+    """Save devices list atomically to user private Application Support storage"""
+    try:
+        APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+        temp_file = DEVICES_FILE.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(devices, f, indent=2)
+        temp_file.replace(DEVICES_FILE)
+        return True
+    except Exception as e:
+        log_err(f"Failed to save devices.json: {e}")
+        return False
+
+def load_scenes():
+    """Load scenes from user private Application Support storage"""
+    if SCENES_FILE.exists():
+        try:
+            with open(SCENES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def resolve_fan_device_id(dev):
+    local_key = str(dev.get("localKey") or "").strip().lower()
+    if local_key and local_key != "cloud":
+        return local_key
+    dev_id = str(dev.get("id") or "").strip().lower()
+    if dev_id.startswith("atomberg_"):
+        return dev_id[len("atomberg_"):]
+    return dev_id
+
+# ==========================================
+# Intelligent Device Name Matching
+# ==========================================
+def match_device(query, devices):
+    """
+    Finds a device by name or tag.
+    Returns:
+      (dev, None) -> unique match found
+      (None, [candidates]) -> ambiguous matches (multiple matching devices)
+      (None, None) -> not found
+    """
+    q = query.strip().lower()
+    if not q:
+        return None, None
+
+    # 1. Exact match on device name
+    for d in devices:
+        if d.get("name", "").strip().lower() == q:
+            return d, None
+
+    # 2. Exact match on device id
+    for d in devices:
+        if d.get("id", "").strip().lower() == q or d.get("localKey", "").strip().lower() == q:
+            return d, None
+
+    # 3. Substring match on name (e.g. "flow", "desk", "ceiling")
+    name_matches = [d for d in devices if q in d.get("name", "").lower()]
+    if len(name_matches) == 1:
+        return name_matches[0], None
+    elif len(name_matches) > 1:
+        return None, name_matches
+
+    # 4. Fallback to device type match (e.g. "light", "fan", "plug")
+    type_matches = [d for d in devices if d.get("type", "").lower() == q]
+    if len(type_matches) == 1:
+        return type_matches[0], None
+    elif len(type_matches) > 1:
+        return None, type_matches
+
+    # 5. Generic substring match on ID
+    id_matches = [d for d in devices if q in d.get("id", "").lower()]
+    if len(id_matches) == 1:
+        return id_matches[0], None
+
+    return None, None
+
+# ==========================================
+# WiZ Light Controls (UDP)
+# ==========================================
+def wiz_send_udp(ip, payload, timeout=1.0, wait_response=False):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    data = json.dumps(payload).encode("utf-8")
+    resp_data = None
+    try:
+        sock.sendto(data, (ip, 38899))
+        if wait_response:
+            resp, _ = sock.recvfrom(4096)
+            resp_data = json.loads(resp.decode("utf-8"))
+    except Exception:
+        pass
+    finally:
+        sock.close()
+    return resp_data
+
+def wiz_get_pilot(ip):
+    res = wiz_send_udp(ip, {"method": "getPilot", "params": {}}, timeout=0.8, wait_response=True)
+    if res and "result" in res:
+        return res["result"]
+    return None
+
+def probe_wiz_device(ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.5)
+    msg = json.dumps({"method": "getSystemConfig", "params": {}}).encode("utf-8")
+    try:
+        sock.sendto(msg, (ip, 38899))
+        resp, _ = sock.recvfrom(4096)
+        data = json.loads(resp.decode("utf-8"))
+        return data.get("result", {})
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+def discover_wiz_lights(timeout=2.0):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(timeout)
+    msg = json.dumps({"method": "getSystemConfig", "params": {}}).encode("utf-8")
+    discovered = []
+    seen_ips = set()
+    try:
+        sock.sendto(msg, ("255.255.255.255", 38899))
+        while True:
+            try:
+                data, (ip, port) = sock.recvfrom(4096)
+                if ip not in seen_ips:
+                    seen_ips.add(ip)
+                    try:
+                        parsed = json.loads(data.decode("utf-8"))
+                        res = parsed.get("result", {})
+                        mac = res.get("mac", "")
+                        model = res.get("moduleName", "WiZ Light")
+                        discovered.append({"ip": ip, "mac": mac, "model": model})
+                    except Exception:
+                        pass
+            except socket.timeout:
+                break
+    except Exception:
+        pass
+    finally:
+        sock.close()
+    return discovered
+
+def add_wiz_light_by_ip(ip, name=None):
+    log_info(f"Connecting to WiZ Light at {ip}:38899...")
+    info = probe_wiz_device(ip)
+    if not info:
+        log_err(f"Could not reach WiZ Light at {ip}. Ensure the light is powered on and on the same Wi-Fi network.")
+        return False
+
+    mac = info.get("mac", "").lower()
+    if not mac:
+        mac = ip.replace(".", "")
+    clean_id = f"wiz_{mac}"
+    dev_name = name or (f"WiZ Light ({ip})" if not name else name)
+
+    devices = load_devices()
+    existing = next((d for d in devices if d.get("id") == clean_id or d.get("ipAddress") == ip), None)
+    if existing:
+        existing["ipAddress"] = ip
+        if name:
+            existing["name"] = name
+        log_ok(f"Updated existing WiZ light '{existing.get('name')}' at IP {ip}")
+    else:
+        new_light = {
+            "id": clean_id,
+            "name": dev_name,
+            "brand": "WiZ",
+            "type": "light",
+            "ipAddress": ip,
+            "isPowerStrip": False,
+            "socketCount": 4,
+            "socketStates": [True, True, True, True],
+            "socketNames": ["Socket 1", "Socket 2", "Socket 3", "Socket 4"],
+            "tuyaDeviceId": "",
+            "localKey": "",
+            "speed": 3,
+            "brightness": 100,
+            "colorTemperature": 2700,
+            "red": 255, "green": 220, "blue": 180,
+            "targetTemperature": 24,
+            "isFavorite": False,
+            "roomId": None
+        }
+        devices.append(new_light)
+        log_ok(f"Connected new WiZ Light: '{BOLD}{dev_name}{RESET}' (MAC: {mac}, Model: {info.get('moduleName', 'WiZ')}) at {ip}")
+
+    save_devices_to_disk(devices)
+    print(f"💡 You can now control it with: {CYAN}control \"{dev_name}\" on{RESET}")
+    return True
+
+def control_wiz_light(dev, action, value=None, extra=None):
+    ip = dev.get("ipAddress", "")
+    dev_name = dev.get("name", "Light")
+    if not ip or ip == "cloud":
+        log_err(f"'{dev_name}' does not have a valid IP address.")
+        return False
+
+    if action == "on":
+        wiz_send_udp(ip, {"method": "setPilot", "params": {"state": True}})
+        log_ok(f"'{dev_name}' turned {GREEN}ON{RESET}")
+    elif action == "off":
+        wiz_send_udp(ip, {"method": "setPilot", "params": {"state": False}})
+        log_ok(f"'{dev_name}' turned {RED}OFF{RESET}")
+    elif action in ["brightness", "bright", "dim"] or (action.isdigit() and 10 <= int(action) <= 100):
+        level = int(action) if action.isdigit() else int(value)
+        level = max(10, min(100, level))
+        wiz_send_udp(ip, {"method": "setPilot", "params": {"state": True, "dimming": level}})
+        log_ok(f"'{dev_name}' brightness set to {BOLD}{level}%{RESET}")
+    elif action in ["temp", "kelvin", "temperature"]:
+        temp = max(2200, min(6500, int(value)))
+        wiz_send_udp(ip, {"method": "setPilot", "params": {"state": True, "temp": temp}})
+        log_ok(f"'{dev_name}' color temperature set to {BOLD}{temp}K{RESET}")
+    elif action in ["rgb", "color"]:
+        r, g, b = int(value), int(extra[0]), int(extra[1])
+        wiz_send_udp(ip, {"method": "setPilot", "params": {"state": True, "r": r, "g": g, "b": b, "dimming": 100}})
+        log_ok(f"'{dev_name}' color set to RGB({r}, {g}, {b})")
+    elif action == "scene":
+        scene_name = str(value).lower()
+        scene_id = WIZ_SCENES.get(scene_name)
+        if scene_id is None:
+            available = ", ".join(WIZ_SCENES.keys())
+            log_err(f"Unknown WiZ scene: '{value}'. Available: {available}")
+            return False
+        wiz_send_udp(ip, {"method": "setPilot", "params": {"state": True, "sceneId": scene_id}})
+        log_ok(f"'{dev_name}' scene activated: {BOLD}{value.title()}{RESET}")
+    elif action == "status":
+        pilot = wiz_get_pilot(ip)
+        if pilot:
+            st = f"{GREEN}ON{RESET}" if pilot.get("state") else f"{RED}OFF{RESET}"
+            dim = pilot.get("dimming", 100)
+            temp = pilot.get("temp", "")
+            temp_str = f" • {temp}K" if temp else ""
+            print(f"💡 {BOLD}{dev_name}{RESET} [{ip}]: {st} • Brightness: {dim}%{temp_str}")
+        else:
+            print(f"💡 {BOLD}{dev_name}{RESET} [{ip}]: {YELLOW}Unreachable{RESET}")
+    else:
+        log_err(f"Unknown action '{action}' for light. Use on, off, brightness, temp, rgb, scene, or status.")
+        return False
+    return True
+
+# ==========================================
+# Atomberg Fan Controls (Cloud API)
+# ==========================================
+ATOMBERG_BASE = "https://api.developer.atomberg-iot.com"
+
+def get_atomberg_access_token(api_key, refresh_token):
+    url = f"{ATOMBERG_BASE}/v1/get_access_token"
+    req = urllib.request.Request(url, headers={
+        "X-API-Key": api_key,
+        "x-api-key": api_key,
+        "Authorization": f"Bearer {refresh_token}",
+        "Accept": "application/json"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("message", {}).get("access_token") or data.get("access_token")
+    except Exception as e:
+        log_err(f"Failed to authenticate with Atomberg Cloud: {e}")
+        return None
+
+def sync_atomberg_fans(custom_name=None):
+    api_key = get_preference("atomberg_api_key")
+    refresh_token = get_preference("atomberg_refresh_token")
+    if not api_key or not refresh_token:
+        log_err("Atomberg API credentials not found. Configure them in the Control app settings.")
+        return False
+
+    token = get_atomberg_access_token(api_key, refresh_token)
+    if not token:
+        return False
+
+    log_info("Fetching registered fans from Atomberg Cloud...")
+    req = urllib.request.Request(
+        f"{ATOMBERG_BASE}/v1/get_list_of_devices",
+        headers={"X-API-Key": api_key, "x-api-key": api_key, "Authorization": f"Bearer {token}", "Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            fan_list = data.get("message", {}).get("devices_list", [])
+            if not fan_list:
+                log_warn("No fans found in your Atomberg account.")
+                return False
+
+            devices = load_devices()
+            added_count = 0
+            for item in fan_list:
+                dev_id = str(item.get("device_id") or item.get("id") or "").lower()
+                fan_name = custom_name if (custom_name and len(fan_list) == 1) else (item.get("name") or "Atomberg Fan")
+
+                existing = next((d for d in devices if d.get("type") == "fan" and (
+                    d.get("localKey", "").lower() == dev_id or d.get("id", "").lower().endswith(dev_id)
+                )), None)
+
+                if existing:
+                    existing["name"] = fan_name
+                    existing["localKey"] = dev_id.upper()
+                    log_info(f"Fan '{fan_name}' (ID: {dev_id}) is already connected.")
+                else:
+                    new_fan = {
+                        "id": f"atomberg_{dev_id[-6:].upper() if len(dev_id)>=6 else dev_id.upper()}",
+                        "name": fan_name,
+                        "brand": "Atomberg",
+                        "type": "fan",
+                        "ipAddress": "cloud",
+                        "localKey": dev_id.upper(),
+                        "tuyaDeviceId": "",
+                        "isPowerStrip": False,
+                        "socketCount": 4,
+                        "socketStates": [True, True, True, True],
+                        "socketNames": ["Socket 1", "Socket 2", "Socket 3", "Socket 4"],
+                        "speed": 3,
+                        "brightness": 100,
+                        "colorTemperature": 4000,
+                        "red": 255, "green": 255, "blue": 255,
+                        "targetTemperature": 24,
+                        "isFavorite": False,
+                        "roomId": None
+                    }
+                    devices.append(new_fan)
+                    added_count += 1
+                    log_ok(f"Connected new Atomberg Fan: '{BOLD}{fan_name}{RESET}' (ID: {dev_id})")
+
+            save_devices_to_disk(devices)
+            print(f"🌀 You can now control it with: {CYAN}control \"{fan_name}\" speed 4{RESET}")
+            return True
+    except Exception as e:
+        log_err(f"Failed to fetch Atomberg devices: {e}")
+        return False
+
+def control_atomberg_fan(dev, action, value=None):
+    api_key = get_preference("atomberg_api_key")
+    refresh_token = get_preference("atomberg_refresh_token")
+
+    if not api_key or not refresh_token:
+        log_err("Atomberg API credentials not found. Configure them in the Control app settings.")
+        return False
+
+    dev_id = resolve_fan_device_id(dev)
+    dev_name = dev.get("name", "Fan")
+    token = get_atomberg_access_token(api_key, refresh_token)
+    if not token:
+        return False
+
+    cmd_dict = {}
+    msg = ""
+
+    if action == "on":
+        cmd_dict = {"power": True}
+        msg = f"'{dev_name}' turned {GREEN}ON{RESET}"
+    elif action == "off":
+        cmd_dict = {"power": False}
+        msg = f"'{dev_name}' turned {RED}OFF{RESET}"
+    elif action == "speed" or (action.isdigit() and 1 <= int(action) <= 6):
+        spd = int(action) if action.isdigit() else int(value)
+        spd = max(1, min(6, spd))
+        cmd_dict = {"power": True, "speed": spd}
+        msg = f"'{dev_name}' speed set to {BOLD}{spd}{RESET}"
+    elif action == "boost":
+        turn_on = value is None or str(value).lower() in ["on", "true", "1"]
+        cmd_dict = {"power": True, "speed": 6 if turn_on else 4}
+        msg = f"'{dev_name}' boost mode {'activated' if turn_on else 'deactivated'}"
+    elif action == "sleep":
+        sleep_on = value is None or str(value).lower() in ["on", "true", "1"]
+        cmd_dict = {"sleep": sleep_on}
+        msg = f"'{dev_name}' sleep mode {'enabled' if sleep_on else 'disabled'}"
+    elif action == "led":
+        led_on = value is None or str(value).lower() in ["on", "true", "1"]
+        cmd_dict = {"led": led_on}
+        msg = f"'{dev_name}' LED {'turned on' if led_on else 'turned off'}"
+    elif action == "status":
+        req = urllib.request.Request(
+            f"{ATOMBERG_BASE}/v1/get_device_state?device_id={dev_id}",
+            headers={
+                "X-API-Key": api_key,
+                "x-api-key": api_key,
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                states = data.get("message", {}).get("device_state", [])
+                if states:
+                    s = states[0]
+                    pwr = f"{GREEN}ON{RESET}" if s.get("power") else f"{RED}OFF{RESET}"
+                    spd = s.get("last_recorded_speed") or s.get("speed", 3)
+                    online = f"{GREEN}Online{RESET}" if s.get("is_online") else f"{RED}Offline{RESET}"
+                    led_state = f"{GREEN}ON{RESET}" if s.get("led") else f"{RED}OFF{RESET}"
+                    sleep_st = "Active" if s.get("sleep_mode") else "Off"
+                    print(f"🌀 {BOLD}{dev_name}{RESET}: {pwr} • Speed: {spd}/6 • LED: {led_state} • Sleep: {sleep_st} • Cloud: {online}")
+                    return True
+        except Exception as e:
+            log_err(f"Failed to fetch fan state: {e}")
+            return False
+    else:
+        log_err(f"Unknown action '{action}' for fan. Use on, off, speed 1-6, boost, sleep, led, or status.")
+        return False
+
+    if cmd_dict:
+        post_data = json.dumps({"device_id": dev_id, "command": cmd_dict}).encode()
+        req = urllib.request.Request(
+            f"{ATOMBERG_BASE}/v1/send_command",
+            data=post_data,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": api_key,
+                "x-api-key": api_key,
+                "Authorization": f"Bearer {token}"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                log_ok(msg)
+                return True
+        except Exception as e:
+            log_err(f"Failed to send command to fan: {e}")
+            return False
+    return True
+
+# ==========================================
+# Homemate / Tuya Plug Controls
+# ==========================================
+def add_tuya_plug_to_devices(device_id, name=None, socket_count=None):
+    devices = load_devices()
+    region = get_preference("tuya_region") or "in"
+    access_id = get_preference("tuya_access_id")
+    access_secret = get_preference("tuya_access_secret")
+
+    if not access_id or not access_secret:
+        log_err("Tuya Access ID and Secret not found. Please set them in Control settings.")
+        return False
+
+    log_info(f"Connecting to Tuya Cloud to verify device '{device_id}'...")
+    res = subprocess.run(
+        [sys.executable, str(TUYA_HELPER), "status", region, access_id, access_secret, device_id],
+        capture_output=True, text=True
+    )
+    detected_sockets = 1
+    if res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            result_items = data.get("result", [])
+            socket_nums = []
+            for item in result_items:
+                code = item.get("code", "")
+                if code.startswith("switch_"):
+                    try:
+                        socket_nums.append(int(code.replace("switch_", "")))
+                    except ValueError:
+                        pass
+            if socket_nums:
+                detected_sockets = max(socket_nums)
+            elif any(item.get("code") == "switch" for item in result_items):
+                detected_sockets = 1
+        except Exception:
+            pass
+    else:
+        log_warn("Could not verify device with Tuya cloud immediately, proceeding with addition...")
+
+    num_sockets = socket_count if socket_count is not None else (4 if detected_sockets > 1 else 1)
+    is_strip = num_sockets > 1
+
+    clean_id = f"homemate_{device_id}" if not device_id.startswith("homemate_") else device_id
+    dev_name = name or (f"Homemate {num_sockets}-Socket Strip" if is_strip else "Homemate Smart Plug")
+
+    existing = next((d for d in devices if d.get("tuyaDeviceId") == device_id or d.get("id") == clean_id), None)
+    if existing:
+        existing["name"] = dev_name
+        existing["socketCount"] = num_sockets
+        existing["isPowerStrip"] = is_strip
+        log_ok(f"Updated existing device '{dev_name}' (ID: {device_id})")
+    else:
+        new_dev = {
+            "id": clean_id,
+            "name": dev_name,
+            "brand": "Homemate",
+            "type": "plug",
+            "ipAddress": "cloud",
+            "tuyaDeviceId": device_id,
+            "localKey": "",
+            "isPowerStrip": is_strip,
+            "socketCount": num_sockets,
+            "socketStates": [True] * num_sockets,
+            "socketNames": [f"Socket {i+1}" for i in range(num_sockets)],
+            "speed": 3,
+            "brightness": 100,
+            "colorTemperature": 4000,
+            "red": 255, "green": 255, "blue": 255,
+            "targetTemperature": 24,
+            "isFavorite": False,
+            "roomId": None
+        }
+        devices.append(new_dev)
+        log_ok(f"Connected and added new device: '{BOLD}{dev_name}{RESET}' ({num_sockets} Sockets)")
+
+    save_devices_to_disk(devices)
+    print(f"🔌 You can now control it with: {CYAN}control \"{dev_name}\" 1 on{RESET}")
+    return True
+
+def control_tuya_plug(dev, action, target="all", state="on"):
+    dev_id = dev.get("tuyaDeviceId") or dev.get("id")
+    dev_name = dev.get("name", "Power Strip")
+    region = get_preference("tuya_region") or "in"
+    access_id = get_preference("tuya_access_id")
+    access_secret = get_preference("tuya_access_secret")
+
+    if not access_id or not access_secret:
+        log_err("Tuya Access ID/Secret not found in Control settings.")
+        return False
+
+    py_exe = sys.executable
+
+    if action == "status":
+        cmd = [py_exe, str(TUYA_HELPER), "status", region, access_id, access_secret, dev_id]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            data = json.loads(res.stdout)
+            result_items = data.get("result", [])
+            sockets = {}
+            pwr, volt, cur = None, None, None
+            for item in result_items:
+                code = item.get("code", "")
+                val = item.get("value")
+                if code.startswith("switch_"):
+                    num = code.replace("switch_", "")
+                    sockets[num] = f"{GREEN}ON{RESET}" if val else f"{RED}OFF{RESET}"
+                elif code == "cur_power" or code == "power":
+                    pwr = float(val) / 10.0 if val else 0.0
+                elif code == "cur_voltage" or code == "voltage":
+                    volt = float(val) / 10.0 if val else 0.0
+                elif code == "cur_current" or code == "current":
+                    cur = float(val) / 1000.0 if val else 0.0
+
+            sock_str = " | ".join([f"Socket {k}: {v}" for k, v in sorted(sockets.items())])
+            print(f"🔌 {BOLD}{dev_name}{RESET}:")
+            print(f"   {sock_str}")
+            if pwr is not None or volt is not None:
+                print(f"   Telemetry: {pwr or 0:.1f}W • {volt or 0:.1f}V • {cur or 0:.2f}A")
+            return True
+        except Exception:
+            log_err(f"Failed to query power strip: {res.stdout or res.stderr}")
+            return False
+
+    if action in ["on", "off"]:
+        state = action
+        target = "all"
+
+    is_on = state.lower() in ["on", "true", "1"]
+    if target.lower() == "all":
+        cmd = [py_exe, str(TUYA_HELPER), "set_all", region, access_id, access_secret, dev_id, "true" if is_on else "false"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            log_ok(f"'{dev_name}' all sockets turned {GREEN if is_on else RED}{'ON' if is_on else 'OFF'}{RESET}")
+        else:
+            log_err(f"Failed to control '{dev_name}' sockets.")
+    else:
+        try:
+            socket_num = int(target)
+            cmd = [py_exe, str(TUYA_HELPER), "set", region, access_id, access_secret, dev_id, str(socket_num), "true" if is_on else "false"]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                log_ok(f"'{dev_name}' Socket {socket_num} turned {GREEN if is_on else RED}{'ON' if is_on else 'OFF'}{RESET}")
+            else:
+                log_err(f"Failed to control Socket {socket_num}.")
+        except ValueError:
+            log_err(f"Invalid socket number: '{target}'. Use 1-4 or 'all'.")
+            return False
+    return True
+
+# ==========================================
+# Dispatcher by Device
+# ==========================================
+def dispatch_to_device(dev, action, args):
+    dev_type = dev.get("type", "").lower()
+    if dev_type == "light":
+        val = args[0] if len(args) > 0 else None
+        extra = args[1:] if len(args) > 1 else None
+        return control_wiz_light(dev, action, val, extra)
+    elif dev_type == "fan":
+        val = args[0] if len(args) > 0 else None
+        return control_atomberg_fan(dev, action, val)
+    elif dev_type == "plug":
+        if action in ["status"]:
+            return control_tuya_plug(dev, "status")
+        elif action in ["on", "off"]:
+            return control_tuya_plug(dev, action, target="all")
+        elif action in ["1", "2", "3", "4", "all"]:
+            st = args[0] if len(args) > 0 else "on"
+            return control_tuya_plug(dev, "set", target=action, state=st)
+        elif action == "set" and len(args) >= 2:
+            return control_tuya_plug(dev, "set", target=args[0], state=args[1])
+        else:
+            log_err(f"Unknown command for plug. Use: on, off, 1-4 <on|off>, or status.")
+            return False
+    else:
+        log_err(f"Unsupported device type: {dev_type}")
+        return False
+
+# ==========================================
+# Device Removal
+# ==========================================
+def remove_device(query):
+    devices = load_devices()
+    dev, ambiguous = match_device(query, devices)
+    if not dev:
+        if ambiguous:
+            log_err(f"Ambiguous name '{query}'. Multiple devices found:")
+            for d in ambiguous:
+                print(f"  • {d.get('name')} (ID: {d.get('id')})")
+            return False
+        log_err(f"No device found matching '{query}'. Run 'control names' to see available devices.")
+        return False
+
+    dev_name = dev.get("name")
+    dev_id = dev.get("id")
+    devices = [d for d in devices if d.get("id") != dev_id]
+    if save_devices_to_disk(devices):
+        log_ok(f"Removed device '{dev_name}' (ID: {dev_id}) from Control.")
+        return True
+    return False
+
+# ==========================================
+# Scene Execution
+# ==========================================
+def activate_scene(scene_name):
+    devices = load_devices()
+    query = scene_name.strip().lower()
+    log_info(f"Activating scene: {BOLD}{scene_name}{RESET}...")
+
+    lights = [d for d in devices if d.get("type") == "light"]
+    fans = [d for d in devices if d.get("type") == "fan"]
+    plugs = [d for d in devices if d.get("type") == "plug"]
+
+    if "good night" in query or "night" in query or "bed" in query:
+        for l in lights: control_wiz_light(l, "off")
+        for f in fans: control_atomberg_fan(f, "speed", 1)
+        for p in plugs: control_tuya_plug(p, "off", target="all")
+        log_ok("Scene 'Good Night' activated: lights off, fan speed 1, plugs off.")
+    elif "movie" in query or "cinema" in query:
+        for l in lights:
+            control_wiz_light(l, "scene", "cozy")
+            control_wiz_light(l, "brightness", 15)
+        for f in fans: control_atomberg_fan(f, "speed", 2)
+        log_ok("Scene 'Movie Mode' activated: dim cozy lighting, silent fan.")
+    elif "focus" in query or "work" in query or "study" in query:
+        for l in lights:
+            control_wiz_light(l, "scene", "daylight")
+            control_wiz_light(l, "brightness", 100)
+        for f in fans: control_atomberg_fan(f, "speed", 3)
+        for p in plugs: control_tuya_plug(p, "on", target="all")
+        log_ok("Scene 'Focus' activated: daylight lighting, fan speed 3, plugs on.")
+    elif "relax" in query or "ambient" in query:
+        for l in lights:
+            control_wiz_light(l, "scene", "warm white")
+            control_wiz_light(l, "brightness", 40)
+        for f in fans: control_atomberg_fan(f, "speed", 2)
+        log_ok("Scene 'Relax' activated: warm glow at 40%, gentle fan.")
+    elif "all off" in query:
+        for l in lights: control_wiz_light(l, "off")
+        for f in fans: control_atomberg_fan(f, "off")
+        for p in plugs: control_tuya_plug(p, "off", target="all")
+        log_ok("Scene 'All Off' activated: all devices powered down.")
+    elif "all on" in query:
+        for l in lights:
+            control_wiz_light(l, "on")
+            control_wiz_light(l, "brightness", 100)
+        for f in fans:
+            control_atomberg_fan(f, "on")
+            control_atomberg_fan(f, "speed", 3)
+        for p in plugs: control_tuya_plug(p, "on", target="all")
+        log_ok("Scene 'All On' activated: all devices powered on.")
+    else:
+        scenes = load_scenes()
+        matched = next((s for s in scenes if s.get("name", "").lower() == query), None)
+        if matched:
+            log_ok(f"Custom scene '{matched.get('name')}' activated.")
+        else:
+            log_err(f"Unknown scene: '{scene_name}'")
+            print_scenes()
+
+def print_scenes():
+    print(f"\n{BOLD}Available Quick Scenes:{RESET}")
+    print(f"  • {CYAN}Good Night{RESET}  - Lights off, fan to silent speed 1, plugs off")
+    print(f"  • {CYAN}Movie Mode{RESET}  - WiZ Cozy 15%, fan speed 2")
+    print(f"  • {CYAN}Focus{RESET}       - WiZ Daylight 100%, fan speed 3, plugs on")
+    print(f"  • {CYAN}Relax{RESET}       - WiZ Warm White 40%, fan speed 2")
+    print(f"  • {CYAN}All Off{RESET}     - Turn off all lights, fans, and sockets")
+    print(f"  • {CYAN}All On{RESET}      - Turn on all devices\n")
+
+def list_device_names():
+    devices = load_devices()
+    print(f"\n{BOLD}Available Device Names & Call Aliases:{RESET}\n")
+    if not devices:
+        print("  No devices configured yet. Run 'control add' to connect your first device!")
+        return
+
+    print(f"  {BOLD}{'Type':<10} {'Device Name':<28} {'Call Aliases':<26} {'Example Usage'}{RESET}")
+    print(f"  {'─'*8}  {'─'*26}  {'─'*24}  {'─'*22}")
+
+    for dev in devices:
+        name = dev.get("name", "Unknown")
+        dev_type = dev.get("type", "").lower()
+
+        icon = "💡 Light" if dev_type == "light" else "🌀 Fan" if dev_type == "fan" else "🔌 Plug" if dev_type == "plug" else "❄️ AC"
+
+        aliases = [f"'{name}'"]
+        if " " in name:
+            aliases.append(f"'{name.split()[0].lower()}'")
+
+        if "wiz" in name.lower() and "'wiz'" not in aliases:
+            aliases.append("'wiz'")
+        elif "homemate" in name.lower() and "'strip'" not in aliases:
+            aliases.append("'strip'")
+
+        alias_str = ", ".join(aliases)
+
+        first_alias = aliases[1].replace("'", "") if len(aliases) > 1 else aliases[0].replace("'", "")
+        if " " in first_alias:
+            first_alias = f'"{first_alias}"'
+
+        if dev_type == "light":
+            example = f"control {first_alias} 80"
+        elif dev_type == "fan":
+            example = f"control {first_alias} speed 4"
+        elif dev_type == "plug":
+            example = f"control {first_alias} 1 on"
+        else:
+            example = f"control {first_alias} on"
+
+        print(f"  {icon:<10} {name:<28} {alias_str:<26} {CYAN}{example}{RESET}")
+
+    print(f"\n{DIM}Tip: Names are case-insensitive. Run 'control add' to connect a new device.{RESET}\n")
+
+def list_devices():
+    devices = load_devices()
+    print(f"\n{BOLD}=== Control Smart Devices ==={RESET}\n")
+    if not devices:
+        print("  No devices configured yet. Run 'control add' to connect a new device.")
+        return
+
+    for dev in devices:
+        name = dev.get("name", "Unknown")
+        brand = dev.get("brand", "").capitalize()
+        dev_type = dev.get("type", "").lower()
+        ip = dev.get("ipAddress", "")
+
+        call_hint = f"{CYAN}'{name}'{RESET}"
+        if " " in name:
+            first_word = name.split()[0].lower()
+            call_hint += f" or {CYAN}'{first_word}'{RESET}"
+
+        if dev_type == "light":
+            print(f"💡 {BOLD}{name}{RESET} ({brand} Light) • Call as: {call_hint}")
+            pilot = wiz_get_pilot(ip)
+            if pilot:
+                pwr = f"{GREEN}ON{RESET}" if pilot.get("state") else f"{RED}OFF{RESET}"
+                dim = pilot.get("dimming", 100)
+                temp = pilot.get("temp", "")
+                temp_str = f" • {temp}K" if temp else ""
+                print(f"   Status: {pwr} • Brightness: {dim}%{temp_str} • IP: {ip}")
+            else:
+                print(f"   Status: {YELLOW}Reachable{RESET} • IP: {ip}")
+
+        elif dev_type == "fan":
+            dev_id = resolve_fan_device_id(dev)
+            print(f"🌀 {BOLD}{name}{RESET} ({brand} Fan) • Call as: {call_hint}")
+            api_key = get_preference("atomberg_api_key")
+            refresh_token = get_preference("atomberg_refresh_token")
+            state_info = None
+            if api_key and refresh_token:
+                try:
+                    token = get_atomberg_access_token(api_key, refresh_token)
+                    if token:
+                        req = urllib.request.Request(
+                            f"{ATOMBERG_BASE}/v1/get_device_state?device_id={dev_id}",
+                            headers={
+                                "X-API-Key": api_key, "x-api-key": api_key,
+                                "Authorization": f"Bearer {token}", "Accept": "application/json"
+                            }
+                        )
+                        with urllib.request.urlopen(req, timeout=2.0) as resp:
+                            data = json.loads(resp.read().decode())
+                            states = data.get("message", {}).get("device_state", [])
+                            if states:
+                                s = states[0]
+                                pwr = f"{GREEN}ON{RESET}" if s.get("power") else f"{RED}OFF{RESET}"
+                                spd = s.get("last_recorded_speed") or s.get("speed", 3)
+                                online = f"{GREEN}Online{RESET}" if s.get("is_online") else f"{RED}Offline{RESET}"
+                                state_info = f"   Status: {pwr} • Speed: {spd}/6 • Cloud: {online} • ID: {dev_id}"
+                except Exception:
+                    pass
+            if state_info:
+                print(state_info)
+            else:
+                spd = dev.get("speed", 3)
+                print(f"   Speed: {spd}/6 • Cloud Connected • ID: {dev_id}")
+
+        elif dev_type == "plug":
+            print(f"🔌 {BOLD}{name}{RESET} ({brand} Strip) • Call as: {call_hint}")
+            sock_states = dev.get("socketStates", [True, True, True, True])
+            socks = " | ".join([f"S{i+1}: {GREEN+'ON'+RESET if s else RED+'OFF'+RESET}" for i, s in enumerate(sock_states)])
+            print(f"   Sockets: {socks}")
+
+        print()
+
+# ==========================================
+# Network Scanner & Discovery
+# ==========================================
+def scan_network():
+    print(f"\n{BOLD}🔍 Scanning local Wi-Fi network and cloud accounts for devices...{RESET}\n")
+    devices = load_devices()
+    existing_ips = {d.get("ipAddress") for d in devices}
+    existing_macs = {d.get("localKey", "").lower() for d in devices}
+    existing_ids = {d.get("id", "").lower() for d in devices}
+
+    # 1. WiZ Lights via UDP broadcast
+    print(f"{BOLD}[1/2] Scanning for WiZ Lights on local Wi-Fi (UDP port 38899)...{RESET}")
+    wiz_found = discover_wiz_lights(timeout=2.0)
+    if wiz_found:
+        for w in wiz_found:
+            ip = w["ip"]
+            mac = w["mac"]
+            model = w["model"]
+            is_added = ip in existing_ips or f"wiz_{mac}" in existing_ids
+            status_tag = f"{GREEN}[Connected]{RESET}" if is_added else f"{YELLOW}[NEW DEVICE]{RESET}"
+            print(f"  💡 WiZ Light at {BOLD}{ip}{RESET} (MAC: {mac}, Model: {model}) {status_tag}")
+            if not is_added:
+                print(f"     ↳ To connect, run: {CYAN}control add light {ip} \"Desk Light\"{RESET}")
+    else:
+        print(f"  {DIM}No responding WiZ lights on broadcast.{RESET}")
+
+    # 2. Atomberg Cloud Account
+    print(f"\n{BOLD}[2/2] Checking Atomberg Cloud Account for registered fans...{RESET}")
+    api_key = get_preference("atomberg_api_key")
+    refresh_token = get_preference("atomberg_refresh_token")
+    if api_key and refresh_token:
+        token = get_atomberg_access_token(api_key, refresh_token)
+        if token:
+            try:
+                req = urllib.request.Request(
+                    f"{ATOMBERG_BASE}/v1/get_list_of_devices",
+                    headers={"X-API-Key": api_key, "Authorization": f"Bearer {token}", "Accept": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    data = json.loads(resp.read().decode())
+                    fans = data.get("message", {}).get("devices_list", [])
+                    for f in fans:
+                        f_id = f.get("device_id", "").lower()
+                        f_name = f.get("name", "Atomberg Fan")
+                        is_added = f_id in existing_macs or any(f_id in d.get("id", "").lower() for d in devices)
+                        status_tag = f"{GREEN}[Connected]{RESET}" if is_added else f"{YELLOW}[NEW DEVICE]{RESET}"
+                        print(f"  🌀 Atomberg Fan '{BOLD}{f_name}{RESET}' (Device ID: {f_id}) {status_tag}")
+                        if not is_added:
+                            print(f"     ↳ To connect, run: {CYAN}control add fan \"{f_name}\"{RESET}")
+            except Exception as e:
+                print(f"  {DIM}Could not check Atomberg cloud: {e}{RESET}")
+    else:
+        print(f"  {DIM}Atomberg credentials not set.{RESET}")
+
+    print(f"\n{BOLD}💡 To connect a Homemate/Tuya plug/strip:{RESET}")
+    print(f"   Run: {CYAN}control add plug <device_id> [name]{RESET}\n")
+
+# ==========================================
+# Interactive Addition Wizard
+# ==========================================
+def interactive_add():
+    print(f"\n{BOLD}========================================={RESET}")
+    print(f"{BOLD}➕ Connect a New Smart Device{RESET}")
+    print(f"{BOLD}========================================={RESET}")
+    print(f"  [1] WiZ Light (Wi-Fi IP or Auto-Scan)")
+    print(f"  [2] Atomberg Smart Fan (Cloud Sync)")
+    print(f"  [3] Homemate / Tuya Plug or Strip (Device ID)")
+    print(f"  [4] Scan Network for Devices\n")
+
+    try:
+        choice = input(f"{BOLD}Select device type [1-4]: {RESET}").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return
+
+    if choice == "1":
+        print(f"\n{BOLD}Connect WiZ Light:{RESET}")
+        try:
+            ip = input("Enter Light IP Address [or press Enter to auto-scan]: ").strip()
+            if not ip:
+                discovered = discover_wiz_lights(timeout=2.0)
+                if not discovered:
+                    log_err("No WiZ lights found on broadcast. Enter IP address manually.")
+                    return
+                print("\nDiscovered lights on local Wi-Fi:")
+                for idx, d in enumerate(discovered):
+                    print(f"  [{idx + 1}] {d['ip']} (MAC: {d['mac']}, {d['model']})")
+                sel = input(f"Select light [1-{len(discovered)}]: ").strip()
+                if not sel.isdigit() or not (1 <= int(sel) <= len(discovered)):
+                    log_err("Invalid selection.")
+                    return
+                ip = discovered[int(sel) - 1]["ip"]
+
+            name = input("Enter a name for this light (e.g. 'Desk Light') [WiZ Light]: ").strip()
+            add_wiz_light_by_ip(ip, name if name else None)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+    elif choice == "2":
+        print(f"\n{BOLD}Connect Atomberg Fan:{RESET}")
+        try:
+            name = input("Enter optional custom name [press Enter to use Atomberg account name]: ").strip()
+            sync_atomberg_fans(name if name else None)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+    elif choice == "3":
+        print(f"\n{BOLD}Connect Homemate / Tuya Plug or Strip:{RESET}")
+        try:
+            dev_id = input("Enter Tuya Virtual Device ID: ").strip()
+            if not dev_id:
+                log_err("Device ID cannot be empty.")
+                return
+            name = input("Enter name for this plug/strip [Homemate Plug]: ").strip()
+            socks = input("Number of sockets (1 for single plug, 4 for strip) [4]: ").strip()
+            num_socks = int(socks) if socks.isdigit() else 4
+            add_tuya_plug_to_devices(dev_id, name if name else None, num_socks)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+    elif choice == "4":
+        scan_network()
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ["-h", "--help", "help"]:
+        print(f"""{BOLD}Control CLI{RESET} - Smart Home Terminal Manager
+
+{BOLD}USAGE:{RESET}
+  control <device_name_or_type> <command> [arguments]
+
+{BOLD}CONNECT & MANAGE DEVICES:{RESET}
+  control add                       Interactive wizard to connect any new device
+  control add light <ip> [name]     Connect WiZ Light at specified IP (e.g. 192.168.1.50)
+  control add fan [name]            Sync and connect fans from Atomberg Cloud
+  control add plug <id> [name]      Connect Homemate / Tuya plug or strip with device ID
+  control scan / discover           Scan local Wi-Fi and accounts for new devices
+  control remove / delete <name>    Disconnect and remove a device by name
+
+{BOLD}DEVICE LISTING & STATUS:{RESET}
+  control names                     List all device names, call aliases, and examples
+  control list / status             List devices with real-time status
+  control scenes                    Show list of quick scenes
+  control scene <name>              Activate quick scene (e.g. "Good Night", "Movie Mode")
+
+{BOLD}CALL BY NAME EXAMPLES:{RESET}
+  control Flow speed 4              Set 'Flow' fan speed to 4
+  control Flow on / off             Turn 'Flow' fan on/off
+  control "WiZ Light" on            Turn 'WiZ Light' on
+  control "WiZ Light" 60            Set brightness to 60%
+  control homemate 1 on             Turn Socket 1 on
+  control homemate all off          Turn all sockets off
+""")
+        return
+
+    first_arg = sys.argv[1].lower()
+
+    if first_arg in ["names", "name", "tags", "aliases"]:
+        list_device_names()
+        return
+    elif first_arg in ["list", "devices"]:
+        if len(sys.argv) > 2 and sys.argv[2].lower() in ["names", "--names", "-n"]:
+            list_device_names()
+        else:
+            list_devices()
+        return
+    elif first_arg in ["scan", "discover"]:
+        scan_network()
+        return
+    elif first_arg in ["add", "connect", "pair"]:
+        if len(sys.argv) == 2:
+            interactive_add()
+            return
+
+        target_type = sys.argv[2].lower()
+        if target_type in ["light", "wiz"]:
+            if len(sys.argv) < 4:
+                log_err("Usage: control add light <ip_address> [name]")
+                print("Tip: Run 'control scan' to discover the IP address of your WiZ lights.")
+                return
+            ip = sys.argv[3]
+            name = " ".join(sys.argv[4:]) if len(sys.argv) >= 5 else None
+            add_wiz_light_by_ip(ip, name)
+            return
+        elif target_type in ["fan", "atomberg"]:
+            name = " ".join(sys.argv[3:]) if len(sys.argv) >= 4 else None
+            sync_atomberg_fans(name)
+            return
+        elif target_type in ["plug", "strip", "tuya", "homemate"]:
+            if len(sys.argv) < 4:
+                log_err("Usage: control add plug <device_id> [name] [sockets]")
+                return
+            dev_id = sys.argv[3]
+            name = sys.argv[4] if len(sys.argv) >= 5 else None
+            socks = int(sys.argv[5]) if len(sys.argv) >= 6 and sys.argv[5].isdigit() else None
+            add_tuya_plug_to_devices(dev_id, name, socks)
+            return
+        else:
+            log_err(f"Unknown device type '{target_type}'. Use: light, fan, or plug.")
+            return
+
+    elif first_arg in ["remove", "delete", "rm", "unlink"]:
+        if len(sys.argv) < 3:
+            log_err("Usage: control remove <device_name>")
+            list_device_names()
+            return
+        target = " ".join(sys.argv[2:])
+        remove_device(target)
+        return
+
+    elif first_arg in ["scenes"]:
+        print_scenes()
+        return
+    elif first_arg in ["scene"]:
+        if len(sys.argv) < 3:
+            log_err("Usage: control scene <name>")
+            print_scenes()
+            return
+        activate_scene(" ".join(sys.argv[2:]))
+        return
+
+    # Check for direct quick scene invocation (e.g. `control night`, `control movie`)
+    full_str = " ".join(sys.argv[1:]).lower()
+    scenes = ["good night", "movie mode", "movie", "focus", "relax", "all off", "all on", "night"]
+    if full_str in scenes:
+        activate_scene(full_str)
+        return
+
+    devices = load_devices()
+
+    # Match device name from arguments.
+    matched_dev = None
+    action_index = -1
+
+    for words in range(min(len(sys.argv) - 1, 4), 0, -1):
+        candidate_name = " ".join(sys.argv[1:1 + words])
+        dev, ambiguous = match_device(candidate_name, devices)
+        if dev:
+            matched_dev = dev
+            action_index = 1 + words
+            break
+        elif ambiguous:
+            log_err(f"Ambiguous target '{candidate_name}'. Multiple devices found:")
+            for d in ambiguous:
+                print(f"  • {BOLD}{d.get('name')}{RESET} ({d.get('type')})")
+            print(f"\nPlease specify by exact name, e.g.: control \"{ambiguous[0].get('name')}\" on")
+            return
+
+    if not matched_dev:
+        log_err(f"No device found matching '{sys.argv[1]}'. Run 'control names' to see all devices, or 'control add' to connect one.")
+        return
+
+    if action_index >= len(sys.argv):
+        dispatch_to_device(matched_dev, "status", [])
+        return
+
+    action = sys.argv[action_index].lower()
+    remaining_args = sys.argv[action_index + 1:]
+
+    dispatch_to_device(matched_dev, action, remaining_args)
+
+if __name__ == "__main__":
+    main()
