@@ -24,6 +24,7 @@ Supports local network and cloud control for:
 ```
 Control/
 ├── .gitignore             # Git ignore rules for SPM .build, app bundles, and local data
+├── LICENSE                # MIT License
 ├── README.md              # Project documentation and CLI usage guide
 ├── Package.swift          # Swift Package Manager manifest
 ├── bundle_app.sh          # Shell script to build and package Control.app
@@ -123,3 +124,15 @@ open Control.app
 ./scripts/create_dmg.sh
 ```
 The resulting `Control.dmg` can be copied or AirDropped to another MacBook.
+
+---
+
+## Disclaimer
+
+This is an independent, community-driven open-source project. All product names, logos, brands, and registered trademarks (including WiZ, Atomberg, Tuya, Homemate, Carrier, and Midea) are property of their respective owners. Their use in this project is strictly for identification and hardware interoperability purposes only and does not imply any affiliation, sponsorship, or endorsement.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
