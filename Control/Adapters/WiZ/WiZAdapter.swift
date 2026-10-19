@@ -14,6 +14,7 @@ final class WiZAdapter {
         defer { close(sock) }
 
         var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
         inet_pton(AF_INET, host, &addr.sin_addr)

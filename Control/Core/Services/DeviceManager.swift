@@ -424,17 +424,24 @@ final class DeviceManager {
         for device in devices where device.brand == .atomberg {
             let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
             if hasLocalIP {
-                let isReachable = await AtombergLocalAdapter.shared.checkLocalReachability(ip: device.ipAddress)
+                let isReachable = await AtombergLocalAdapter.shared.checkLocalReachability(ip: device.ipAddress, mac: device.localKey)
                 if isReachable {
+                    let wasOffline = !device.isOnline
                     device.consecutiveFailures = 0
                     device.isOnline = true
                     device.unreachableAlertMessage = nil
                     device.unreachableTrigger = nil
+                    // When device was offline (e.g. wall switch was off), or if user is resyncing and isOn is false:
+                    // BLDC fans resume spinning on wall power restore; ensure isOn is true so power button lights up
+                    if wasOffline || !device.isOn {
+                        device.isOn = true
+                        if device.speed == 0 { device.speed = 3 }
+                    }
                 } else {
                     device.consecutiveFailures += 1
                     if device.consecutiveFailures >= 5 {
                         device.isOnline = false
-                        device.isOn = false
+                        // Keep device.isOn untouched so when wall switch turns back on, it resumes ON state
                     }
                 }
             } else if !AtombergCloudAdapter.shared.apiKey.isEmpty {
@@ -454,30 +461,35 @@ final class DeviceManager {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 pollCount += 1
 
-                // 1. Homemate 4-Socket Strip (every 2.5s)
+                // 1. Homemate 4-Socket Strip (every 5s)
                 await syncTuyaDevices()
 
-                // 2. WiZ Smart Light local UDP (every 2.5s)
+                // 2. WiZ Smart Light local UDP (every 5s)
                 for device in devices where device.brand == .wiz {
                     await wizAdapter.refreshState(device)
                 }
 
-                // 3. Atomberg Fan (every 2.5s locally, every 60s for cloud-only)
+                // 3. Atomberg Fan (every 5s locally, every 120s for cloud-only)
                 for device in devices where device.brand == .atomberg {
                     let hasLocalIP = !device.ipAddress.isEmpty && device.ipAddress.lowercased() != "cloud"
                     if hasLocalIP {
-                        let isReachable = await AtombergLocalAdapter.shared.checkLocalReachability(ip: device.ipAddress)
+                        let isReachable = await AtombergLocalAdapter.shared.checkLocalReachability(ip: device.ipAddress, mac: device.localKey)
                         let isRecent = Date().timeIntervalSince(device.lastActionDate) < 4.0
                         if isReachable {
+                            let wasOffline = !device.isOnline
                             device.consecutiveFailures = 0
                             device.isOnline = true
                             device.unreachableAlertMessage = nil
                             device.unreachableTrigger = nil
+                            if wasOffline {
+                                device.isOn = true
+                                if device.speed == 0 { device.speed = 3 }
+                            }
                         } else if !isRecent {
                             device.consecutiveFailures += 1
                             if device.consecutiveFailures >= 5 {
                                 device.isOnline = false
-                                device.isOn = false
+                                // Never toggle device.isOn off on routine reachability drop
                             }
                         }
                     } else if pollCount % 24 == 0 && !AtombergCloudAdapter.shared.apiKey.isEmpty {

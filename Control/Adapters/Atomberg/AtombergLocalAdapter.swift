@@ -14,23 +14,91 @@ final class AtombergLocalAdapter {
 
     // MARK: - Local Reachability Probe
 
-    func checkLocalReachability(ip: String) async -> Bool {
+    func checkLocalReachability(ip: String, mac: String = "") async -> Bool {
         guard !ip.isEmpty, ip.lowercased() != "cloud" else { return false }
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/sbin/ping")
-                proc.arguments = ["-c", "1", "-W", "500", ip]
-                proc.standardOutput = Pipe()
-                proc.standardError = Pipe()
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    continuation.resume(returning: proc.terminationStatus == 0)
-                } catch {
-                    continuation.resume(returning: false)
+                let sock = socket(AF_INET, SOCK_DGRAM, 0)
+                guard sock >= 0 else {
+                    continuation.resume(returning: self.checkArpFallback(ip: ip, mac: mac))
+                    return
+                }
+                defer { close(sock) }
+
+                var opt: Int32 = 1
+                setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
+                setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, socklen_t(MemoryLayout<Int32>.size))
+
+                // 2.5s timeout (captures at least two 1.0s beacon intervals with room for Wi-Fi jitter)
+                var tv = timeval(tv_sec: 2, tv_usec: 500_000)
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+                var bindAddr = sockaddr_in()
+                bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                bindAddr.sin_family = sa_family_t(AF_INET)
+                bindAddr.sin_port = UInt16(5625).bigEndian
+                bindAddr.sin_addr.s_addr = INADDR_ANY
+
+                let bindRes = withUnsafePointer(to: &bindAddr) { saPtr in
+                    saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        bind(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+                guard bindRes == 0 else {
+                    continuation.resume(returning: self.checkArpFallback(ip: ip, mac: mac))
+                    return
+                }
+
+                var fromAddr = sockaddr_in()
+                var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                var buf = [UInt8](repeating: 0, count: 1024)
+
+                let bytes = withUnsafeMutablePointer(to: &fromAddr) { saPtr in
+                    saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        recvfrom(sock, &buf, buf.count, 0, sa, &fromLen)
+                    }
+                }
+
+                if bytes > 0 {
+                    var ipBuf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                    inet_ntop(AF_INET, &fromAddr.sin_addr, &ipBuf, socklen_t(INET_ADDRSTRLEN))
+                    let senderIP = String(cString: ipBuf)
+                    let payload = (String(bytes: buf[0..<bytes], encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    let targetMac = mac.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    let match = senderIP == ip || (!targetMac.isEmpty && payload == targetMac) || ip.isEmpty
+                    continuation.resume(returning: match)
+                } else {
+                    continuation.resume(returning: self.checkArpFallback(ip: ip, mac: mac))
                 }
             }
+        }
+    }
+
+    private nonisolated func checkArpFallback(ip: String, mac: String) -> Bool {
+        guard !ip.isEmpty, ip.lowercased() != "cloud" else { return false }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+        proc.arguments = ["-n", ip]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0 else { return false }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let out = String(data: data, encoding: .utf8)?.lowercased() else { return false }
+            if out.contains("no match") || out.contains("incomplete") {
+                return false
+            }
+            if !mac.isEmpty {
+                let cleanMac = mac.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "").lowercased()
+                let cleanOut = out.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "")
+                return cleanOut.contains(cleanMac) || out.contains("(")
+            }
+            return out.contains("(") && out.contains("at ")
+        } catch {
+            return false
         }
     }
 
@@ -50,10 +118,10 @@ final class AtombergLocalAdapter {
         }
 
         // Verify physical reachability before command
-        let isReachable = await checkLocalReachability(ip: host)
+        let isReachable = await checkLocalReachability(ip: host, mac: device.localKey)
         if !isReachable {
             device.isOnline = false
-            device.isOn = false
+            // Keep device.isOn untouched so power state is preserved
             device.triggerUnreachableAlert(reason: "Fan is unreachable. Wall switch is OFF or disconnected.")
             throw NetworkError.deviceUnreachable("Wall switch is OFF or fan is disconnected")
         }
@@ -211,6 +279,7 @@ final class AtombergLocalAdapter {
                                     ipAddress: ip
                                 )
                                 dev.isOnline = true
+                                dev.isOn = true
                                 dev.localKey = mac.uppercased()
                                 dev.lastSeen = Date()
 

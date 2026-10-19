@@ -168,6 +168,35 @@ def check_ip_reachable(ip, timeout_ms=500):
     except Exception:
         return False
 
+def check_atomberg_beacon(ip=None, timeout=2.5):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    try:
+        s.bind(("0.0.0.0", 5625))
+        s.settimeout(timeout)
+        data, addr = s.recvfrom(1024)
+        if ip and ip != "cloud":
+            matched = (addr[0] == ip or data.decode().strip().lower() in ip.lower())
+            if matched:
+                return True
+        else:
+            return True
+    except Exception:
+        pass
+    finally:
+        s.close()
+
+    # Fast fallback: check ARP table if socket timed out
+    if ip and ip != "cloud":
+        try:
+            out = subprocess.check_output(["arp", "-n", ip], stderr=subprocess.DEVNULL).decode().lower()
+            if "no match" not in out and "incomplete" not in out and ":" in out:
+                return True
+        except Exception:
+            pass
+    return False
+
 # WiZ Light Controls (UDP)
 # ==========================================
 def wiz_send_udp(ip, payload, timeout=1.0, wait_response=False):
@@ -453,40 +482,39 @@ def sync_atomberg_fans(custom_name=None):
         return False
 
 def control_atomberg_fan(dev, action, value=None):
-    api_key = get_preference("atomberg_api_key")
-    refresh_token = get_preference("atomberg_refresh_token")
-
-    if not api_key or not refresh_token:
-        log_err("Atomberg API credentials not found. Configure them in the Control app settings.")
-        return False
-
     dev_id = resolve_fan_device_id(dev)
     dev_name = dev.get("name", "Fan")
     ip = dev.get("ipAddress", "")
-    if ip and ip != "cloud" and not check_ip_reachable(ip):
-        log_err(f"\x27{dev_name}\x27 is UNREACHABLE at {ip}. Check if wall switch is ON.")
-        return False
-    token = get_atomberg_access_token(api_key, refresh_token)
-    if not token:
+
+    # 1. Verify reachability if local IP is configured
+    if ip and ip != "cloud" and not check_atomberg_beacon(ip, timeout=2.5):
+        log_err(f"'{dev_name}' is UNREACHABLE at {ip}. Check if wall switch is ON.")
         return False
 
     cmd_dict = {}
     msg = ""
 
     if action == "on":
-        cmd_dict = {"power": True}
+        spd = max(1, min(6, dev.get("speed", 4)))
+        cmd_dict = {"power": True, "speed": spd}
+        dev["isOn"] = True
         msg = f"'{dev_name}' turned {GREEN}ON{RESET}"
     elif action == "off":
         cmd_dict = {"power": False}
+        dev["isOn"] = False
         msg = f"'{dev_name}' turned {RED}OFF{RESET}"
     elif action == "speed" or (action.isdigit() and 1 <= int(action) <= 6):
         spd = int(action) if action.isdigit() else int(value)
         spd = max(1, min(6, spd))
         cmd_dict = {"power": True, "speed": spd}
+        dev["isOn"] = True
+        dev["speed"] = spd
         msg = f"'{dev_name}' speed set to {BOLD}{spd}{RESET}"
     elif action == "boost":
         turn_on = value is None or str(value).lower() in ["on", "true", "1"]
         cmd_dict = {"power": True, "speed": 6 if turn_on else 4}
+        dev["isOn"] = True
+        dev["speed"] = 6 if turn_on else 4
         msg = f"'{dev_name}' boost mode {'activated' if turn_on else 'deactivated'}"
     elif action == "sleep":
         sleep_on = value is None or str(value).lower() in ["on", "true", "1"]
@@ -497,33 +525,43 @@ def control_atomberg_fan(dev, action, value=None):
         cmd_dict = {"led": led_on}
         msg = f"'{dev_name}' LED {'turned on' if led_on else 'turned off'}"
     elif action == "status":
-        req = urllib.request.Request(
-            f"{ATOMBERG_BASE}/v1/get_device_state?device_id={dev_id}",
-            headers={
-                "X-API-Key": api_key,
-                "x-api-key": api_key,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                states = data.get("message", {}).get("device_state", [])
-                if states:
-                    s = states[0]
-                    pwr = f"{GREEN}ON{RESET}" if s.get("power") else f"{RED}OFF{RESET}"
-                    spd = s.get("last_recorded_speed") or s.get("speed", 3)
-                    online = f"{GREEN}Online{RESET}" if s.get("is_online") else f"{RED}Offline{RESET}"
-                    led_state = f"{GREEN}ON{RESET}" if s.get("led") else f"{RED}OFF{RESET}"
-                    sleep_st = "Active" if s.get("sleep_mode") else "Off"
-                    print(f"🌀 {BOLD}{dev_name}{RESET}: {pwr} • Speed: {spd}/6 • LED: {led_state} • Sleep: {sleep_st} • Cloud: {online}")
-                    return True
-        except Exception as e:
-            log_err(f"Failed to fetch fan state: {e}")
-            return False
+        pwr = f"{GREEN}ON{RESET}" if dev.get("isOn", True) else f"{RED}OFF{RESET}"
+        spd = dev.get("speed", 4)
+        online = f"{GREEN}Online{RESET}" if dev.get("isOnline", True) else f"{RED}Offline{RESET}"
+        print(f"🌀 {BOLD}{dev_name}{RESET}: {pwr} • Speed: {spd}/6 • Local IP: {ip} • Status: {online}")
+        return True
     else:
         log_err(f"Unknown action '{action}' for fan. Use on, off, speed 1-6, boost, sleep, led, or status.")
+        return False
+
+    # 2. Prefer Local UDP Command (Port 5600) - instantaneous and immune to cloud 429 quota
+    if ip and ip != "cloud":
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2.0)
+            s.sendto(json.dumps(cmd_dict).encode("utf-8"), (ip, 5600))
+            s.close()
+            dev["isOnline"] = True
+            all_devs = load_devices()
+            for d in all_devs:
+                if d.get("id") == dev.get("id"):
+                    d["isOn"] = dev.get("isOn", True)
+                    d["speed"] = dev.get("speed", 4)
+                    d["isOnline"] = True
+            save_devices(all_devs)
+            log_ok(msg)
+            return True
+        except Exception as e:
+            log_warn(f"Local UDP command failed: {e}. Trying cloud fallback...")
+
+    # 3. Cloud Fallback
+    api_key = get_preference("atomberg_api_key")
+    refresh_token = get_preference("atomberg_refresh_token")
+    if not api_key or not refresh_token:
+        log_err("Atomberg API credentials not configured.")
+        return False
+    token = get_atomberg_access_token(api_key, refresh_token)
+    if not token:
         return False
 
     if cmd_dict:
@@ -540,6 +578,14 @@ def control_atomberg_fan(dev, action, value=None):
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
+                dev["isOnline"] = True
+                all_devs = load_devices()
+                for d in all_devs:
+                    if d.get("id") == dev.get("id"):
+                        d["isOn"] = dev.get("isOn", True)
+                        d["speed"] = dev.get("speed", 4)
+                        d["isOnline"] = True
+                save_devices(all_devs)
                 log_ok(msg)
                 return True
         except Exception as e:
@@ -835,18 +881,21 @@ def resync_all_devices():
             if not synced:
                 ip = dev.get("ipAddress", "")
                 if ip and ip != "cloud":
-                    if check_ip_reachable(ip):
+                    if check_atomberg_beacon(ip, timeout=2.5):
                         online_count += 1
+                        was_offline = not dev.get("isOnline", False)
                         dev["isOnline"] = True
+                        if was_offline or not dev.get("isOn", False):
+                            dev["isOn"] = True
+                            if dev.get("speed", 0) == 0:
+                                dev["speed"] = 3
                         st = f"{GREEN}ON{RESET}" if dev.get("isOn") else f"{RED}OFF{RESET}"
                         print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {GREEN}ONLINE{RESET} (Local) • State: {st} • Speed: {dev.get('speed', 3)}/6 [IP: {ip}]")
                     else:
                         dev["isOnline"] = False
-                        dev["isOn"] = False
                         print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Fan is offline or wall switch is OFF [IP: {ip}]")
                 else:
                     dev["isOnline"] = False
-                    dev["isOn"] = False
                     print(f"  🌀 {BOLD}{dev_name:<26}{RESET} [{brand}] {RED}UNREACHABLE{RESET} • Fan is offline or cloud is unreachable")
 
         elif dev_type == "plug":

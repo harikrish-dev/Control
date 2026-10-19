@@ -220,6 +220,8 @@ struct SavedDevice: Codable {
     var currentPower: Double? = nil
     var currentVoltage: Double? = nil
     var currentCurrent: Double? = nil
+    var isOn: Bool? = nil
+    var isOnline: Bool? = nil
 
     @MainActor init(from device: SmartDevice) {
         self.id = device.id
@@ -245,6 +247,8 @@ struct SavedDevice: Codable {
         self.currentPower = device.currentPower
         self.currentVoltage = device.currentVoltage
         self.currentCurrent = device.currentCurrent
+        self.isOn = device.isOn
+        self.isOnline = device.isOnline
     }
 
     @MainActor func toSmartDevice() -> SmartDevice {
@@ -269,7 +273,8 @@ struct SavedDevice: Codable {
         dev.currentPower = currentPower
         dev.currentVoltage = currentVoltage
         dev.currentCurrent = currentCurrent
-        dev.isOnline = false
+        dev.isOn = isOn ?? false
+        dev.isOnline = isOnline ?? false
         return dev
     }
 }
